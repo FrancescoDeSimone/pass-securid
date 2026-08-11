@@ -1,0 +1,231 @@
+.\"    Man page for pass-securid
+.\"
+.TH pass-securid 1 "2026-08-11" "1.0.0" "User Commands"
+.SH NAME
+pass-securid \- generate and store RSA SecurID tokencodes with pass
+.SH SYNOPSIS
+.B pass securid
+.RI [ code ]
+.RB [ \-\-clip ", " \-c ]
+.RB [ \-\-quiet ", " \-q ]
+.RB [ \-\-pin =\fIpin\fP ]
+.RB [ \-\-password =\fIpassword\fP ]
+.RB [ \-\-devid =\fIdevid\fP ]
+.RB [ \-\-time =\fItime\fP ]
+.IR pass-name
+.PP
+.B pass securid
+.B insert
+.RB [ \-\-force ", " \-f ]
+.RB [ \-\-echo ", " \-e ]
+.RB [ \-\-store\-seed ", " \-s ]
+.RB [ \-\-file =\fIfile\fP ]
+.RB [ \-\-pin =\fIpin\fP ]
+.RB [ \-\-devid =\fIdevid\fP ]
+.RB [ \-\-password =\fIpassword\fP ]
+.RI [ pass-name ]
+.PP
+.B pass securid
+.B append
+.RB [ \-\-force ", " \-f ]
+.RB [ \-\-echo ", " \-e ]
+.RB [ \-\-store\-seed ", " \-s ]
+.RB [ \-\-file =\fIfile\fP ]
+.RB [ \-\-pin =\fIpin\fP ]
+.RB [ \-\-devid =\fIdevid\fP ]
+.RB [ \-\-password =\fIpassword\fP ]
+.IR pass-name
+.PP
+.B pass securid
+.B uri
+.RB [ \-\-clip ", " \-c ]
+.IR pass-name
+.PP
+.B pass securid
+.B info
+.RB [ \-\-password =\fIpassword\fP ]
+.RB [ \-\-devid =\fIdevid\fP ]
+.IR pass-name
+.PP
+.B pass securid
+.B validate
+.RB [ \-\-file =\fIfile\fP ]
+.RB [ \-\-password =\fIpassword\fP ]
+.RB [ \-\-devid =\fIdevid\fP ]
+.RI [ token-string ]
+.PP
+.B pass securid
+.BR version | help
+.SH DESCRIPTION
+.B pass-securid
+is an extension for the
+.B pass
+password manager that stores RSA SecurID 128-bit (AES) software tokens in the
+password store and generates their current tokencodes.  It requires only
+.B bash
+and
+.B python3
+(the Python standard library): parsing, seed decryption, AES, and tokencode
+computation are performed by an embedded, dependency-free engine.  The
+.I stoken
+tool is not required.
+.PP
+A token is stored as a single line in a password file: a numeric 81\(en104
+digit "ctf" string, an iPhone/Android URI, or (from QR scanning) any of
+these.  Optional metadata lines cache the PIN, device ID, and decrypted seed:
+.PP
+.RS
+.nf
+com.rsa.securid.iphone://ctf?ctfData=...
+pin: 1234
+devid: a01c4380-fc01-4df0-b113-7fb98ec74694
+seed: 0cd1105cd1aafd893e89f1eb7b800dd8
+.fi
+.RE
+.PP
+The credentials needed for a particular token are resolved from command-line
+flags, cached metadata, or an interactive prompt, in that order.  Tokens that
+are not bound to a password or device ID therefore produce a code with no
+interaction at all.
+.SH COMMANDS
+.TP
+.B code
+Print (or copy to the clipboard with
+.BR \-\-clip )
+the current tokencode for
+.IR pass-name .
+This is the default command:
+.B pass securid pass-name
+is equivalent to
+.BR "pass securid code pass-name" .
+.TP
+.B insert
+Prompt for a SecurID token string (or accept it as the positional argument,
+via
+.BR \-\-file ,
+or from standard input) and store it in the vault.  The token is validated
+before it is written.  If the token is bound to a device ID and none is
+given, it is prompted for once and cached.  With
+.BR \-\-store-seed ,
+the token is decrypted (prompting for the password if needed) and the
+decrypted seed is cached so later codes require no password.  Without
+.BR \-\-store-seed ,
+a password-protected token keeps asking for its password on each code.
+.TP
+.B append
+Attach a SecurID token to an existing password entry, replacing a token line
+if one is already present.
+.TP
+.B uri
+Print the stored token string for
+.IR pass-name .
+.TP
+.B info
+Print the token's serial number, key length, digit count, interval,
+expiration date, and protection flags.  Password/device ID are prompted for
+when the token requires them.
+.TP
+.B validate
+Check that a token string is well-formed and decryptable; print its serial
+number on success.
+.TP
+.B version
+Print the extension version.
+.TP
+.B help
+Show usage.
+.SH OPTIONS
+.TP
+.BR \-c ", " \-\-clip
+Send the generated code (or token URI) to the clipboard instead of standard
+output.  The clipboard is cleared after
+.B $CLIP_TIME
+seconds.
+.TP
+.BR \-q ", " \-\-quiet
+Print the code without a trailing newline (scripting convenience).
+.TP
+.B \-\-pin =\fIpin\fP
+Supply the token PIN.
+.TP
+.B \-\-password =\fIpassword\fP
+Supply the token decryption password.
+.TP
+.B \-\-devid =\fIdevid\fP
+Supply the token's device ID.
+.TP
+.B \-\-time =\fItime\fP
+Compute the code for a specific time: a unix timestamp, or a relative offset
+such as
+.B +60
+or
+.BR \-30 .
+Primarily a testing aid.
+.TP
+.BR \-f ", " \-\-force
+Overwrite an existing password entry without prompting.
+.TP
+.BR \-e ", " \-\-echo
+Echo the token string while prompting for it.
+.TP
+.BR \-s ", " \-\-store-seed
+During
+.B insert
+or
+.BR append ,
+decrypt the seed now and cache it as a
+.B seed:
+line in the password file.
+.TP
+.B \-\-file =\fIfile\fP
+Read the token string from
+.I file
+(or
+.B \-
+for standard input) instead of prompting.
+.SH FILES
+.TP
+.I $PREFIX/.extensions/securid.bash
+Extension location, or the directory named by
+.BR $PASSWORD_STORE_EXTENSIONS_DIR .
+.SH ENVIRONMENT
+.TP
+.B PASSWORD_STORE_SECURID_PYTHON
+Path to the
+.B python3
+interpreter to use (default:
+.BR python3 ).
+.TP
+.B PASSWORD_STORE_ENABLE_EXTENSIONS
+Must be
+.B true
+for pass to load extensions.
+.TP
+.B PASSWORD_STORE_EXTENSIONS_DIR
+Directory containing the
+.B securid.bash
+extension.
+.SH SECURITY CONSIDERATIONS
+Software tokens are easy to replicate; anyone with the seed can generate
+valid tokencodes.  The pass vault's encryption is the security boundary:
+everything, including the optional cached seed, PIN, and device ID, is
+stored inside gpg/age-encrypted password files.  Storing the decrypted seed
+(
+.BR \-\-store-seed )
+relaxes the token's own password to "the pass vault password"; do not use it
+if you need defense-in-depth beyond pass itself.
+.SH LIMITATIONS
+.B sdtid
+XML files are not parsed; convert them first (e.g.
+.BR "stoken export --blocks" ).
+This extension is not affiliated with RSA Security; it implements the
+publicly documented SecurID 128-bit (AES) token algorithm.
+.SH SEE ALSO
+.BR pass (1),
+.BR pass-otp (1),
+.BR stoken (1)
+.SH AUTHOR
+pass-securid, a pass extension modeled on pass-otp.
+.PP
+This man page is licensed under the terms of the GPLv3 (see the source
+distribution).

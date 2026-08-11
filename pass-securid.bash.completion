@@ -1,0 +1,33 @@
+# bash completion for pass securid
+# modeled on pass-otp's completion script.
+_pass_securid_completion() {
+	local commands="code insert append uri info validate version help"
+	local cur prev
+	COMPREPLY=()
+	cur="${COMP_WORDS[COMP_CWORD]}"
+	prev="${COMP_WORDS[COMP_CWORD-1]}"
+
+	for (( i=2; i < COMP_CWORD; i++ )); do
+		case "${COMP_WORDS[i]}" in
+			code|insert|add|append|uri|info|show|validate|version|help)
+				return 0
+				;;
+		esac
+	done
+
+	case "$cur" in
+		-*)
+			COMPREPLY=( $(compgen -W "-c --clip -q --quiet -f --force -e --echo \
+				-s --store-seed --file --pin --password --devid --time \
+				--help --version" -- "$cur") )
+			;;
+		*)
+			if [[ $COMP_CWORD -eq 2 ]]; then
+				COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
+			else
+				COMPREPLY=( $(compgen -f -- "$cur") )
+			fi
+			;;
+	esac
+}
+complete -o filenames -F _pass_securid_completion pass
