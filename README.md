@@ -15,8 +15,10 @@ vault.
   tokencode computation are all implemented in pure bash inside
   `securid.bash`. No `python`, no `stoken`, no `oathtool`, no cryptography
   module. (gpg/age is pass's own requirement for the vault.)
-- Android (v3/v4) tokens run a 1000-iteration PBKDF2 in bash, so codes for
-  those take a few seconds to compute.
+- Android (v3/v4) tokens derive their keys with 1000-iteration PBKDF2-SHA256.
+  When `openssl` (>= 3.0) is on PATH that derivation is delegated to
+  `openssl kdf` and codes come back in ~1s; otherwise the pure-bash
+  implementation handles it in a few seconds
 
 ## Usage
 
@@ -208,8 +210,9 @@ in
 pkgs.pass.withExtensions (exts: [ pass-securid ])
 ```
 
-`securid.bash` is fully self-contained (pure bash), so no PATH or Python
-setup is needed.
+`securid.bash` needs only bash. If `openssl` >= 3.0 is present it is used
+to speed up Android-token key derivation; without it, the pure-bash engine
+still works, just slower on v3/v4 tokens.
 
 ## Testing
 

@@ -653,10 +653,39 @@ _sec_hmac_fast() {    # <msghex> (uses prepared pads) -> _sec_hmachex
   _sec_hmachex="$_sec_shahex"
   _sec_retval="$_sec_shahex"
 }
-# _sec_pbkdf2 <pwhex> <salthex> <iter> <dklen> -> _sec_retval (hex)
+#
+# Backends, probed once at first call:
+#   * openssl >= 3.0 `openssl kdf ... PBKDF2` when available (3-orders faster)
+#   * pure-bash fallback otherwise
 _sec_pbkdf2() {
   local pw="$1" salt="$2" iter="$3" dk="$4"
   local i hx msg h prev="" T=""
+  if [[ -z "$_SEC_PBKDF2_BACKEND" ]]; then
+    # probe openssl kdf availability once (only Linux/GNU-style or 3.x CLI)
+    _SEC_PBKDF2_BACKEND="bash"
+    if command -v openssl >/dev/null 2>&1 && \
+       openssl kdf -help >/dev/null 2>&1 && \
+       openssl kdf -keylen 16 -kdfopt digest:SHA256 -kdfopt hexpass:70617373 \
+          -kdfopt hexsalt:73616c74 -kdfopt iter:1 PBKDF2 >/dev/null 2>&1; then
+      local v
+      v=$(openssl version 2>/dev/null | head -n1)
+      case "$v" in
+        OpenSSL[[:space:]]3.*|OpenSSL[[:space:]]4.*) _SEC_PBKDF2_BACKEND="openssl" ;;
+      esac
+    fi
+  fi
+  if [[ "$_SEC_PBKDF2_BACKEND" == "openssl" ]]; then
+    local o
+    o=$(openssl kdf -keylen "$dk" -kdfopt digest:SHA256 \
+        -kdfopt "hexpass:$pw" -kdfopt "hexsalt:$salt" \
+        -kdfopt "iter:$iter" PBKDF2 2>/dev/null | tr -d ' :\n')
+    if [[ -n "$o" ]]; then
+      _sec_retval="$(printf '%s' "$o" | tr 'A-F' 'a-f')"
+      return 0
+    fi
+    # openssl failed at runtime - fall back to the pure-bash path
+    _SEC_PBKDF2_BACKEND="bash"
+  fi
   _sec_hmac_prep "$pw"
   for (( i = 1; i <= iter; i++ )); do
     if (( i == 1 )); then
