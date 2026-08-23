@@ -2,7 +2,8 @@
 
 A [pass](https://www.passwordstore.org/) extension for managing **RSA SecurID
 128-bit (AES) software tokens**, with an interface modeled on
-[pass-otp](https://github.com/tadfisher/pass-otp).
+[pass-otp](https://github.com/tadfisher/pass-otp) and inspiration
+from [stoken](https://github.com/stoken-dev/stoken)
 
 `pass securid code token-name` prints the current SecurID tokencode; the
 token and any needed PIN/device ID/seed are stored, encrypted, in your pass
@@ -234,6 +235,11 @@ suite, with fixed timestamps, so the expected tokencodes are deterministic.
 - `securid.bash __selftest` runs the fixed token vectors as an install-time
   self-verification; `make test` runs the full vault integration suite.
 - `make check` lints with shellcheck and runs the tests.
+
+## Related projects to thanks
+
+- https://github.com/stoken-dev/stoken
+- https://github.com/pass-extension/pass-otp
 
 ## License
 
