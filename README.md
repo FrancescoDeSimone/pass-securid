@@ -11,11 +11,12 @@ vault.
 ## Requirements / dependencies
 
 - `pass` >= 1.7 (for extension support)
-- `bash`
-- `python3` — **standard library only**. There is no other runtime dependency:
-  the AES, the SecurID CBC-MAC, token parsing/decryption and the tokencode
-  computation are all implemented in the embedded `securid-engine.py`. No
-  `stoken`, no `oathtool`, no cryptography module.
+- `bash` — the AES, the SecurID CBC-MAC, token parsing/decryption and the
+  tokencode computation are all implemented in pure bash inside
+  `securid.bash`. No `python`, no `stoken`, no `oathtool`, no cryptography
+  module. (gpg/age is pass's own requirement for the vault.)
+- Android (v3/v4) tokens run a 1000-iteration PBKDF2 in bash, so codes for
+  those take a few seconds to compute.
 
 ## Usage
 
@@ -207,8 +208,8 @@ in
 pkgs.pass.withExtensions (exts: [ pass-securid ])
 ```
 
-The build bakes the absolute path to Python 3 into the script (pass wrappers
-carry a fixed PATH), so no extra PATH setup is needed.
+`securid.bash` is fully self-contained (pure bash), so no PATH or Python
+setup is needed.
 
 ## Testing
 
@@ -224,10 +225,12 @@ suite, with fixed timestamps, so the expected tokencodes are deterministic.
 
 ## Development
 
-- `securid-engine.py` is the single source of the crypto/parsing engine.
-- `securid.bash` embeds a copy of that engine.
-- `make engine` re-embeds after editing the engine; `make test` fails if the
-  two are out of sync.
+- `securid.bash` is the single source: the whole crypto/parsing engine and the
+  pass command layer live in one file.  The engine is a 1:1 port of the old
+  Python engine (removed) using only bash builtins.
+- `securid.bash __selftest` runs the fixed token vectors as an install-time
+  self-verification; `make test` runs the full vault integration suite.
+- `make check` lints with shellcheck and runs the tests.
 
 ## License
 

@@ -1,7 +1,6 @@
 { lib
 , stdenv
 , bash
-, python3
 }:
 
 stdenv.mkDerivation {
@@ -10,15 +9,6 @@ stdenv.mkDerivation {
   src = ./.;
 
   dontBuild = true;
-
-  buildInputs = [ python3 ];
-
-  # Embed the absolute path to python3 so the engine is found even though the
-  # pass wrapper only carries a fixed PATH (mirrors how pass-otp patches
-  # oathtool into its script).
-  patchPhase = ''
-    sed -i -e 's|SECURID_PYTHON=''${PASSWORD_STORE_SECURID_PYTHON:-python3}|SECURID_PYTHON=${python3}/bin/python3|' securid.bash
-  '';
 
   installFlags = [
     "PREFIX=$(out)"

@@ -61,12 +61,12 @@ pass-securid \- generate and store RSA SecurID tokencodes with pass
 is an extension for the
 .B pass
 password manager that stores RSA SecurID 128-bit (AES) software tokens in the
-password store and generates their current tokencodes.  It requires only
-.B bash
-and
-.B python3
-(the Python standard library): parsing, seed decryption, AES, and tokencode
-computation are performed by an embedded, dependency-free engine.  The
+password store and generates their current tokencodes.  It is implemented
+entirely in
+.BR bash
+(parsing, seed decryption, AES, HMAC/PBKDF2 and the tokencode computation are
+all pure-bash builtins), so no Python, stoken, or cryptography library is
+required.  The
 .I stoken
 tool is not required.
 .PP
@@ -189,12 +189,6 @@ for standard input) instead of prompting.
 Extension location, or the directory named by
 .BR $PASSWORD_STORE_EXTENSIONS_DIR .
 .SH ENVIRONMENT
-.TP
-.B PASSWORD_STORE_SECURID_PYTHON
-Path to the
-.B python3
-interpreter to use (default:
-.BR python3 ).
 .TP
 .B PASSWORD_STORE_ENABLE_EXTENSIONS
 Must be

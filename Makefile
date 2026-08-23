@@ -6,17 +6,12 @@ SYSTEM_EXTENSION_DIR ?= $(LIBDIR)/password-store/extensions
 MANDIR ?= $(PREFIX)/man
 BASHCOMPDIR ?= /etc/bash_completion.d
 
-PYTHON ?= python3
 SHELL := /bin/bash
 
 all:
 	@echo "pass-$(PROG) is a shell script and does not need compilation."
 	@echo "Try \"make install\"."
-	@echo "Requirements: pass >= 1.7, bash, python3 (stdlib only)."
-
-# Keep the engine embedded in securid.bash in sync with securid-engine.py.
-engine:
-	$(PYTHON) tools/embed.py
+	@echo "Requirements: pass >= 1.7, bash."
 
 install:
 	install -d "$(DESTDIR)$(MANDIR)/man1"
@@ -36,9 +31,8 @@ lint:
 	shellcheck -s bash $(PROG).bash
 
 test:
-	$(PYTHON) tools/embed.py --check
 	bash tests/runtest.sh
 
 check: lint test
 
-.PHONY: all engine install uninstall lint test check
+.PHONY: all install uninstall lint test check

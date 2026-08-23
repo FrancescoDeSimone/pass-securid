@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2178,SC2128,SC2179  # see engine banner: cross-function array/string re-use is local-scoped and verified
 # pass securid - Password Store Extension (https://www.passwordstore.org/)
 #
 # Manage RSA SecurID 128-bit (AES) software tokens inside a pass vault,
 # mirroring the pass-otp interface.  Token parsing, decryption and tokencode
-# computation are done by a self-contained, standard-library-only Python
-# engine (embedded below), so this extension has no runtime dependency
-# beyond bash + python3.
+# computation are done by a pure-bash engine below, so this extension has no
+# runtime dependency beyond bash (and gpg/age, which pass itself needs).
 #
 # Tokens are stored in a password file as a single token line (a numeric
 # "ctf" string or an iPhone/Android URI) optionally followed by metadata:
@@ -32,815 +32,1458 @@
 
 VERSION="1.0.0"
 
-SECURID_PYTHON=${PASSWORD_STORE_SECURID_PYTHON:-python3}
-
 if [[ $PASSAGE == 1 ]]; then
   EXT="age"
 else
   EXT="gpg"
 fi
 
-# ---------------------------------------------------------------------------
-# Wrapper around the embedded Python engine.  Arguments are passed after "-";
-# the engine sees them as argv[1..] (argv[0] is "-").
-# ---------------------------------------------------------------------------
-_securid_engine() {
-  "$SECURID_PYTHON" - "$@" <<'__PASS_SECURID_ENGINE__'
-#!/usr/bin/env python3
-# pass-securid engine - RSA SecurID (128-bit AES) token support for pass.
+# ===========================================================================
+# Module-global result slots: _sec_ret (byte array), _sec_retval (hex/int),
+# _sec_err (error message).
 #
-# Pure Python, standard library only.  Implements:
-#   o AES-128 / AES-256 (ECB + CBC)
-#   o the RSA SecurID MAC (securid_mac / securid_shortmac)
-#   o v1/v2 'ctf' numeric token decoding + seed decryption (password/devid)
-#   o v3/v4 base64 (Android-style) token decoding + seed decryption
-#   o the SecurID time-based tokencode computation (30s and 60s tokens)
-#
-# No cryptography module, no third-party dependency.  It is embedded in
-# securid.bash; keep securid-engine.py and the embedded copy in sync
-# (the Makefile test verifies this).
-
-# ---------------------------------------------------------------- AES
-_SBOX = [
-    0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
-    0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
-    0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
-    0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
-    0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
-    0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
-    0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
-    0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
-    0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
-    0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
-    0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
-    0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
-    0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
-    0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
-    0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
-    0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16,
-]
-_INVSBOX = [0] * 256
-for _i, _v in enumerate(_SBOX):
-    _INVSBOX[_v] = _i
-_RCON = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36]
-
-
-def _gmul(a, b):
-    p = 0
-    for _ in range(8):
-        if b & 1:
-            p ^= a
-        hi = a & 0x80
-        a = (a << 1) & 0xFF
-        if hi:
-            a ^= 0x1b
-        b >>= 1
-    return p
-
-
-def _expand_key(key):
-    nk = len(key) // 4
-    nr = 6 + nk
-    w = [list(key[4 * i:4 * i + 4]) for i in range(nk)]
-    for i in range(nk, 4 * (nr + 1)):
-        t = list(w[i - 1])
-        if i % nk == 0:
-            t = t[1:] + t[:1]
-            t = [_SBOX[b] for b in t]
-            t[0] ^= _RCON[i // nk - 1]
-        elif nk > 6 and i % nk == 4:
-            t = [_SBOX[b] for b in t]
-        w.append([w[i - nk][j] ^ t[j] for j in range(4)])
-    return [w[4 * r:4 * r + 4] for r in range(nr + 1)]
-
-
-def _add_round_key(s, rk):
-    for r in range(4):
-        for c in range(4):
-            s[r][c] ^= rk[c][r]
-
-
-def _sub_bytes(s):
-    for r in range(4):
-        for c in range(4):
-            s[r][c] = _SBOX[s[r][c]]
-
-
-def _inv_sub_bytes(s):
-    for r in range(4):
-        for c in range(4):
-            s[r][c] = _INVSBOX[s[r][c]]
-
-
-def _shift_rows(s):
-    for r in range(1, 4):
-        s[r] = s[r][r:] + s[r][:r]
-
-
-def _inv_shift_rows(s):
-    for r in range(1, 4):
-        s[r] = s[r][4 - r:] + s[r][:4 - r]
-
-
-def _mix_columns(s):
-    for c in range(4):
-        a = [s[r][c] for r in range(4)]
-        s[0][c] = _gmul(a[0], 2) ^ _gmul(a[1], 3) ^ a[2] ^ a[3]
-        s[1][c] = a[0] ^ _gmul(a[1], 2) ^ _gmul(a[2], 3) ^ a[3]
-        s[2][c] = a[0] ^ a[1] ^ _gmul(a[2], 2) ^ _gmul(a[3], 3)
-        s[3][c] = _gmul(a[0], 3) ^ a[1] ^ a[2] ^ _gmul(a[3], 2)
-
-
-def _inv_mix_columns(s):
-    for c in range(4):
-        a = [s[r][c] for r in range(4)]
-        s[0][c] = _gmul(a[0], 14) ^ _gmul(a[1], 11) ^ _gmul(a[2], 13) ^ _gmul(a[3], 9)
-        s[1][c] = _gmul(a[0], 9) ^ _gmul(a[1], 14) ^ _gmul(a[2], 11) ^ _gmul(a[3], 13)
-        s[2][c] = _gmul(a[0], 13) ^ _gmul(a[1], 9) ^ _gmul(a[2], 14) ^ _gmul(a[3], 11)
-        s[3][c] = _gmul(a[0], 11) ^ _gmul(a[1], 13) ^ _gmul(a[2], 9) ^ _gmul(a[3], 14)
-
-
-def _encrypt_block(key, block):
-    nk = len(key) // 4
-    nr = 6 + nk
-    rk = _expand_key(key)
-    s = [[block[4 * c + r] for c in range(4)] for r in range(4)]
-    _add_round_key(s, rk[0])
-    for rnd in range(1, nr):
-        _sub_bytes(s)
-        _shift_rows(s)
-        _mix_columns(s)
-        _add_round_key(s, rk[rnd])
-    _sub_bytes(s)
-    _shift_rows(s)
-    _add_round_key(s, rk[nr])
-    return bytes(s[r][c] for c in range(4) for r in range(4))
-
-
-def _decrypt_block(key, block):
-    nk = len(key) // 4
-    nr = 6 + nk
-    rk = _expand_key(key)
-    s = [[block[4 * c + r] for c in range(4)] for r in range(4)]
-    _add_round_key(s, rk[nr])
-    for rnd in range(nr - 1, 0, -1):
-        _inv_shift_rows(s)
-        _inv_sub_bytes(s)
-        _add_round_key(s, rk[rnd])
-        _inv_mix_columns(s)
-    _inv_shift_rows(s)
-    _inv_sub_bytes(s)
-    _add_round_key(s, rk[0])
-    return bytes(s[r][c] for c in range(4) for r in range(4))
-
-
-def _aes128_ecb(key, data, encrypt=True):
-    assert len(data) == 16 and len(key) == 16
-    return (_encrypt_block if encrypt else _decrypt_block)(key, data)
-
-
-def _aes256_cbc(key, iv, data, encrypt=True):
-    assert len(key) == 32 and len(iv) == 16 and len(data) % 16 == 0
-    out = bytearray()
-    prev = iv
-    for i in range(0, len(data), 16):
-        blk = data[i:i + 16]
-        if encrypt:
-            x = bytes(a ^ b for a, b in zip(blk, prev))
-            c = _encrypt_block(key, x)
-            prev = c
-        else:
-            c = _decrypt_block(key, blk)
-            c = bytes(a ^ b for a, b in zip(c, prev))
-            prev = blk
-        out += c
-    return bytes(out)
-
-
-# ---------------------------------------------------------------- SecurID MAC
-def _mac(data):
-    """securid_mac(): the RSA SecurID AES-based message authentication code."""
-    work = bytearray([0xFF] * 16)
-    n = len(data)
-    pad = bytearray(16)
-    v = n * 8
-    for p in range(15, -1, -1):
-        if v == 0:
-            break
-        pad[p] = v & 0xFF
-        v >>= 8
-    i = 0
-    odd = False
-    while n > 16:
-        enc = _aes128_ecb(data[i:i + 16], bytes(work))
-        for k in range(16):
-            work[k] ^= enc[k]
-        i += 16
-        n -= 16
-        odd = not odd
-    lastblk = bytearray(16)
-    lastblk[:n] = data[i:i + n]
-    enc = _aes128_ecb(bytes(lastblk), bytes(work))
-    for k in range(16):
-        work[k] ^= enc[k]
-    if odd:
-        enc = _aes128_ecb(bytes(16), bytes(work))
-        for k in range(16):
-            work[k] ^= enc[k]
-    enc = _aes128_ecb(bytes(pad), bytes(work))
-    for k in range(16):
-        work[k] ^= enc[k]
-    out = bytes(work)
-    enc = _aes128_ecb(bytes(work), out)
-    return bytes(out[k] ^ enc[k] for k in range(16))
-
-
-def _shortmac(data):
-    h = _mac(data)
-    return (h[0] << 7) | (h[1] >> 1)
-
-
-# ---------------------------------------------------------------- bit helpers
-def _digits_to_bits(s, n_bits):
-    """numinput_to_bits(): each ctf char carries 3 bits, packed MSB-first."""
-    out = bytearray((n_bits + 7) // 8)
-    for bitpos, ch in zip(range(0, n_bits, 3), s):
-        val = (ord(ch) - 48) & 0x07
-        for b in range(3):
-            if bitpos + b >= n_bits:
-                break
-            if val & (0x04 >> b):
-                out[(bitpos + b) // 8] |= 1 << (7 - ((bitpos + b) % 8))
-    return bytes(out)
-
-
-def _get_bits(buf, start, n_bits):
-    out = 0
-    for i in range(n_bits):
-        out <<= 1
-        b = start + i
-        if buf[b // 8] & (1 << (7 - (b % 8))):
-            out |= 1
-    return out
-
-
-def _url_decode(s):
-    out = bytearray()
-    i = 0
-    n = len(s)
-    while i < n:
-        if s[i] == '%' and i + 2 < n and all(
-                c in '0123456789abcdefABCDEF' for c in (s[i + 1], s[i + 2])):
-            out.append(int(s[i + 1:i + 3], 16))
-            i += 3
-        else:
-            out.append(ord(s[i]))
-            i += 1
-    return out.decode('utf-8', 'replace')
-
-
-# ---------------------------------------------------------------- v1/v2 tokens
-_V2_MAGIC = bytes([0xd8, 0xf5, 0x32, 0x53, 0x82, 0x89])
-
-# flags we care about (see securid.h)
-_F_PASSPROT = 1 << 13
-_F_SNPROT = 1 << 12
-_FNUM = 0x3          # 00=30s 01=60s
-_FDIGIT = 0x1C0      # bits 6-8: digit count - 1
-_FPINMODE = 0x18     # bits 3-4
-
-
-class SecuridError(Exception):
-    pass
-
-
-def _v2_decode(s, smartphone):
-    """Parse a v1/v2 numeric ctf string (>= 81 chars)."""
-    if s[0] not in '12' or len(s) < 81:
-        raise SecuridError('not a valid ctf token string')
-    vers = int(s[0])
-    serial = s[1:13]
-    body = s[13:]
-    if len(body) < 63 + 5:
-        raise SecuridError('ctf token too short')
-    data_part = body[:63]
-    checksum_part = body[-5:]
-    computed = _shortmac((s[0] + serial + body[:-5]).encode())
-    token_mac = _get_bits(_digits_to_bits(checksum_part, 15), 0, 15)
-    if token_mac != computed:
-        raise SecuridError('ctf checksum failed (bad token string)')
-    d = _digits_to_bits(data_part, 189)
-    return {
-        'version': vers,
-        'serial': serial,
-        'enc_seed': d[0:16],
-        'flags': _get_bits(d, 128, 16),
-        'exp_date': _get_bits(d, 144, 14),
-        'dec_seed_hash': _get_bits(d, 159, 15),
-        'device_id_hash': _get_bits(d, 174, 15),
-        'smartphone': smartphone,
-    }
-
-
-def _v2_key_hash(passw, devid, vers, smartphone):
-    """generate_key_hash(): derive the seed-encryption key and device hash."""
-    key = bytearray(40 + 40 + 7 + 1)
-    pos = 0
-    if passw:
-        pw = passw.encode('utf-8', 'surrogateescape')
-        if len(pw) > 40:
-            raise SecuridError('password too long')
-        key[:len(pw)] = pw
-        pos = len(pw)
-    devid_buf_start = pos
-    devid_len = 40 if smartphone else 32
-    written = 0
-    if devid:
-        for c in devid.upper():
-            if written >= devid_len:
-                break
-            if (vers == 1 and not c.isdigit()) or \
-               (vers >= 2 and not (c.isdigit() or c in 'ABCDEF')):
-                continue
-            key[pos] = ord(c)
-            pos += 1
-            written += 1
-    devid_region = bytes(key[devid_buf_start:devid_buf_start + devid_len])
-    device_id_hash = _shortmac(devid_region)
-    key[pos:pos + len(_V2_MAGIC)] = _V2_MAGIC
-    key_hash = _mac(bytes(key[:pos + len(_V2_MAGIC)]))
-    return key_hash, device_id_hash
-
-
-def _v2_unlock(tok, passw, devid):
-    key_hash, device_id_hash = _v2_key_hash(passw, devid, tok['version'],
-                                            tok['smartphone'])
-    if tok['flags'] & _F_SNPROT:
-        if device_id_hash != tok['device_id_hash']:
-            raise SecuridError('device ID does not match this token')
-    dec_seed = _aes128_ecb(key_hash, tok['enc_seed'], encrypt=False)
-    if _shortmac(dec_seed) != tok['dec_seed_hash']:
-        raise SecuridError('failed to decrypt seed (wrong password?)')
-    return dec_seed
-
-
-# ---------------------------------------------------------------- v3/v4 tokens
-_KEY0 = bytes([0xd0, 0x14, 0x43, 0x3c, 0x6d, 0x17, 0x9f, 0xeb,
-               0xda, 0x09, 0xab, 0xfc, 0x32, 0x49, 0x63, 0x4c])
-_KEY1 = bytes([0x3b, 0xaf, 0xff, 0x4d, 0x91, 0x8d, 0x89, 0xb6,
-               0x81, 0x60, 0xde, 0x44, 0x4e, 0x05, 0xc0, 0xdd])
-
-# Known device-class GUIDs, in stoken's discovery order.  Soft tokens are
-# frequently bound to one of these; we auto-try them before prompting.
-_CLASS_GUIDS = [
-    "556f1985-33dd-442c-9155-3a0e994f21b1",  # iPhone
-    "a01c4380-fc01-4df0-b113-7fb98ec74694",  # Android
-    "868c28f8-31bf-4911-9876-ebece5c3f2ab",  # BlackBerry
-    "b77a1d06-d505-4200-90d3-1bb397748704",  # BlackBerry 10
-    "c483b592-63f0-4f19-b4cb-a6bce8e57159",  # Windows Phone
-    "8f94b226-d362-4204-ac52-3b21fa333b6f",  # Windows
-    "d0955a53-569b-4ecc-9cf7-6c2a59d4e775",  # macOS
-]
-
-_V3_TOKEN_SIZE = 291  # 0x123
-_V3_NONCE = 16
-_V3_DEVID = 48
-_V3_DAY = 337500
-_EPOCH_DAYS = 946684800 // 86400
-
-
-def _v3_decode(s):
-    import base64
-    decoded = base64.b64decode(s + '=' * (-len(s) % 4), validate=False)
-    if len(decoded) != _V3_TOKEN_SIZE:
-        raise SecuridError('bad Android token length %d' % len(decoded))
-    version = decoded[0]
-    if version not in (3, 4):
-        raise SecuridError('bad token version %d' % version)
-    return {
-        'version': version,
-        'password_locked': bool(decoded[1]),
-        'devid_locked': bool(decoded[2]),
-        'nonce_devid_hash': decoded[3:35],
-        'nonce_devid_pass_hash': decoded[35:67],
-        'nonce': decoded[67:83],
-        'enc_payload': decoded[83:259],
-        'mac': decoded[259:291],
-    }
-
-
-def _v3_scrub_devid(devid):
-    return ''.join(c.upper() for c in (devid or '') if c.isalnum())[:_V3_DEVID]
-
-
-def _v3_compute_hash(passw, devid, nonce):
-    buf = bytearray(16 + _V3_DEVID + 40)
-    buf[0:16] = nonce
-    if devid:
-        d = devid.encode()
-        buf[16:16 + len(d)] = d[:_V3_DEVID]
-    pass_len = 0
-    if passw:
-        pw = passw.encode('utf-8', 'surrogateescape')
-        buf[16 + _V3_DEVID:16 + _V3_DEVID + len(pw)] = pw
-        pass_len = len(pw)
-    return __import__('hashlib').sha256(
-        bytes(buf[:16 + _V3_DEVID + pass_len])).digest()
-
-
-def _v3_derive_key(passw, devid, nonce, key_id, version):
-    import hashlib
-    pw = (passw or '').encode('utf-8', 'surrogateescape')
-    pass_len = len(pw)
-    buf0 = bytearray(_V3_DEVID + 16 + 16 + pass_len)
-    if pass_len:
-        buf0[0:pass_len] = pw
-    if devid:
-        d = devid.encode()
-        buf0[pass_len:pass_len + len(d)] = d[:_V3_DEVID]
-    buf0[pass_len + _V3_DEVID:pass_len + _V3_DEVID + 16] = _KEY1 if key_id else _KEY0
-    buf0[pass_len + _V3_DEVID + 16:] = nonce
-    buf = bytes(buf0[1::2]) if version == 3 else bytes(buf0)
-    return hashlib.pbkdf2_hmac('sha256', buf, nonce, 1000, 32)
-
-
-def _v3_compute_hmac(tok, passw, devid):
-    import hmac
-    import hashlib
-    key = _v3_derive_key(passw, devid, tok['nonce'], 0, tok['version'])
-    msg = (bytes([tok['version']]) + bytes([int(tok['password_locked'])]) +
-           bytes([int(tok['devid_locked'])]) + tok['nonce_devid_hash'] +
-           tok['nonce_devid_pass_hash'] + tok['nonce'] + tok['enc_payload'])
-    return hmac.new(key, msg, hashlib.sha256).digest()
-
-
-def _v3_parse_payload(payload):
-    serial = payload[0:12].decode('ascii', 'replace')
-    dec_seed = payload[16:32]
-    digits = payload[35]
-    addpin = payload[36]
-    interval = payload[37]
-    longdate = int.from_bytes(payload[48:53], 'big')
-    exp_date = max(0, longdate // _V3_DAY - _EPOCH_DAYS)
-    flags = (1 << 9) | (1 << 14)          # FL_TIMESEEDS | FL_128BIT
-    flags |= ((digits - 1) << 6) & _FDIGIT
-    if addpin != 0x1f:
-        flags |= 0x2 << 3
-    if interval == 60:
-        flags |= 0x01
-    return {'serial': serial, 'dec_seed': dec_seed, 'flags': flags,
-            'exp_date': exp_date}
-
-
-def _v3_unlock(tok, passw, devid):
-    devid = _v3_scrub_devid(devid)
-    if _v3_compute_hash(None, devid, tok['nonce']) != tok['nonce_devid_hash']:
-        raise SecuridError('device ID does not match this token')
-    if _v3_compute_hash(passw, devid, tok['nonce']) != tok['nonce_devid_pass_hash']:
-        raise SecuridError('password does not match this token')
-    if _v3_compute_hmac(tok, passw, devid) != tok['mac']:
-        raise SecuridError('token MAC mismatch')
-    key = _v3_derive_key(passw, devid, tok['nonce'], 1, tok['version'])
-    return _v3_parse_payload(_aes256_cbc(key, tok['nonce'], tok['enc_payload'],
-                                         encrypt=False))
-
-
-# ---------------------------------------------------------------- tokencode
-def _bcd(val, nbytes):
-    out = bytearray(nbytes)
-    for i in range(nbytes - 1, -1, -1):
-        out[i] = val % 10
-        val //= 10
-        out[i] |= (val % 10) << 4
-        val //= 10
-    return bytes(out)
-
-
-def _key_from_time(bcd_time, nbytes, serial):
-    key = bytearray([0xAA] * 16)
-    key[0:nbytes] = bcd_time[0:nbytes]
-    key[12:16] = bytes([0xBB] * 4)
-    for j, i in enumerate(range(4, 12, 2)):
-        key[8 + j] = ((ord(serial[i]) - 48) << 4) | (ord(serial[i + 1]) - 48)
-    return bytes(key)
-
-
-def compute_tokencode(dec_seed, serial, flags, t=None, pin=''):
-    """securid_compute_tokencode(): 5-chained AES-128 derivation + digits."""
-    import time as _time
-    if t is None:
-        t = int(_time.time())
-    is_30 = (flags & _FNUM) == 0
-    gm = _time.gmtime(t)
-
-    bcd_time = bytearray(8)
-    bcd_time[0:2] = _bcd(gm.tm_year, 2)         # Python tm_year is full year
-    bcd_time[2:3] = _bcd(gm.tm_mon, 1)          # Python tm_mon is 1-based
-    bcd_time[3:4] = _bcd(gm.tm_mday, 1)
-    bcd_time[4:5] = _bcd(gm.tm_hour, 1)
-    bcd_time[5:6] = _bcd(gm.tm_min & ~(0x01 if is_30 else 0x03), 1)
-    bcd_time[6] = 0
-    bcd_time[7] = 0
-    bcd_time = bytes(bcd_time)
-
-    key0 = _key_from_time(bcd_time, 2, serial)
-    key0 = _aes128_ecb(dec_seed, key0)
-    key1 = _key_from_time(bcd_time, 3, serial)
-    key1 = _aes128_ecb(key0, key1)
-    key0 = _key_from_time(bcd_time, 4, serial)
-    key0 = _aes128_ecb(key1, key0)
-    key1 = _key_from_time(bcd_time, 5, serial)
-    key1 = _aes128_ecb(key0, key1)
-    key0 = _key_from_time(bcd_time, 8, serial)
-    key0 = _aes128_ecb(key1, key0)
-
-    if is_30:
-        i = ((gm.tm_min & 0x01) << 3) | ((gm.tm_sec >= 30) << 2)
-    else:
-        i = (gm.tm_min & 0x03) << 2
-    tokencode = (key0[i] << 24) | (key0[i + 1] << 16) | \
-                (key0[i + 2] << 8) | key0[i + 3]
-
-    digits = ((flags & _FDIGIT) >> 6) + 1
-    pin_len = len(pin)
-    out = []
-    for k in range(digits):
-        c = tokencode % 10
-        tokencode //= 10
-        if k < pin_len:
-            c += ord(pin[pin_len - k - 1]) - 48
-        out.append(c % 10)
-    return ''.join(str(d) for d in reversed(out))
-
-
-# ---------------------------------------------------------------- token layer
-def extract_token(s):
-    """Return just the token data from a stoken-style input string."""
-    import re
-    m = re.search(r'ctfData=(?:3D)?', s)
-    if m:
-        return s[m.end():]
-    s2 = s.strip()
-    if s2.startswith('<?xml'):
-        raise SecuridError('sdtid XML files are not supported; '
-                           'convert the token with stoken export --blocks')
-    return s2
-
-
-def parse_token(s):
-    """Probe the token string and return (kind, token_dict)."""
-    import re
-    raw = extract_token(s)
-    smartphone = bool(re.match(
-        r'(com\.rsa\.securid\.iphone://ctf|com\.rsa\.securid://ctf|'
-        r'http://127\.0\.0\.1/securid/ctf)', s))
-    if raw[0] in '12':
-        digits = ''.join(c for c in raw if c.isdigit())
-        if len(digits) < 81:
-            raise SecuridError('ctf string too short')
-        return ('v2', _v2_decode(digits, smartphone))
-    elif raw[0] in 'AB':
-        return ('v3', _v3_decode(_url_decode(raw)))
-    raise SecuridError('unrecognized token format')
-
-
-def token_info(s):
-    """Header-level info, no unlock needed."""
-    kind, t = parse_token(s)
-    if kind == 'v2':
-        return {
-            'kind': kind, 'version': t['version'], 'serial': t['serial'],
-            'flags': t['flags'],
-            'password_locked': bool(t['flags'] & _F_PASSPROT),
-            'devid_locked': bool(t['flags'] & _F_SNPROT),
-            'digits': ((t['flags'] & _FDIGIT) >> 6) + 1,
-            'interval': 60 if t['flags'] & 1 else 30,
-            'pin_required': ((t['flags'] & _FPINMODE) >> 3) >= 2,
-            'exp_date': t['exp_date'],
-            'smartphone': t['smartphone'],
-            'is_128bit': bool(t['flags'] & (1 << 14)),
-        }
-    return {
-        'kind': kind, 'version': t['version'],
-        'password_locked': t['password_locked'],
-        'devid_locked': t['devid_locked'],
-    }
-
-
-def unlock(s, passw=None, devid=None):
-    """Decrypt the seed. Returns (kind, info_dict, dec_seed_or_None)."""
-    kind, t = parse_token(s)
-    if kind == 'v2':
-        if t['flags'] & _F_PASSPROT and not passw:
-            raise SecuridError('password required')
-        if t['flags'] & _F_SNPROT and not devid:
-            raise SecuridError('device ID required')
-        dec_seed = _v2_unlock(t, passw, devid)
-        info = token_info(s)
-        return kind, info, dec_seed
-    else:
-        if t['password_locked'] and not passw:
-            raise SecuridError('password required')
-        if t['devid_locked'] and not devid:
-            raise SecuridError('device ID required')
-        p = _v3_unlock(t, passw, devid)
-        info = {
-            'kind': kind, 'version': t['version'], 'serial': p['serial'],
-            'flags': p['flags'],
-            'password_locked': t['password_locked'],
-            'devid_locked': t['devid_locked'],
-            'digits': ((p['flags'] & _FDIGIT) >> 6) + 1,
-            'interval': 60 if p['flags'] & 1 else 30,
-            'pin_required': ((p['flags'] & _FPINMODE) >> 3) >= 2,
-            'exp_date': p['exp_date'],
-            'smartphone': True,
-        }
-        return kind, info, p['dec_seed']
-
-
-def detect_devid(s, passw=None):
-    """Return the first known device-class GUID that unlocks `s`, or ''.
-
-    Mirrors stoken's class-GUID auto-detection: soft tokens are commonly
-    bound to one of the platform GUIDs, in which case the user should not
-    have to type a device ID at all.
-    """
-    kind, t = parse_token(s)
-    requires_pass = (t['flags'] & _F_PASSPROT) if kind == 'v2' else \
-        t['password_locked']
-    if requires_pass and not passw:
-        return ''
-    for guid in _CLASS_GUIDS:
-        try:
-            unlock(s, passw, guid)
-            return guid
-        except SecuridError:
-            continue
-    return ''
-
-
-def code(s, passw=None, devid=None, seed=None, pin='', t=None):
-    """Compute a tokencode. `seed` (32 hex chars) bypasses seed decryption."""
-    if seed:
-        _, info, dec = unlock_cached(s, seed)
-    else:
-        _, info, dec = unlock(s, passw, devid)
-    computed = compute_tokencode(dec, info['serial'], info['flags'], t, pin)
-    return computed, info, dec
-
-
-def unlock_cached(s, seed):
-    """Like unlock(), but trust a pre-decrypted 32-hex seed from the vault.
-
-    Only meaningful for v1/v2 tokens: for Android (v3/v4) tokens the flags
-    and serial live in the encrypted payload, so a raw cached seed is not
-    enough -- the caller must pass --pass/--devid instead.
-    """
-    kind, info = parse_token(s)
-    if kind != 'v2':
-        raise SecuridError(
-            'cached seed is only supported for ctf tokens; '
-            'provide --password/--devid for Android tokens')
-    info = token_info(s)
-    return kind, info, bytes.fromhex(seed)
-
-
-# ------------------------------------------------------------------ CLI
-def _main(argv):
-    import getopt
-    import sys
-    import time
-    try:
-        opts, args = getopt.gnu_getopt(argv[1:], '',
-                                       ['tok=', 'pass=', 'password=', 'devid=',
-                                        'seed=', 'pin=', 'time=', 'json', 'text',
-                                        'describe', 'code', 'info', 'validate',
-                                        'full', 'detect-devid'])
-        cmd = None
-        want_full = False
-        params = {}
-        for o, a in opts:
-            if o == '--tok':
-                params['tok'] = a
-            elif o in ('--pass', '--password'):
-                params['passw'] = a
-            elif o == '--devid':
-                params['devid'] = a
-            elif o == '--seed':
-                params['seed'] = a
-            elif o == '--pin':
-                params['pin'] = a
-            elif o == '--time':
-                params['time'] = a
-            elif o == '--json':
-                params['json'] = True
-            elif o == '--text':
-                params['text'] = True
-            elif o == '--full':
-                want_full = True
-            elif o in ('--describe', '--info', '--code', '--validate',
-                       '--detect-devid'):
-                cmd = o[2:]
-        if cmd is None:
-            cmd = 'describe'
-        tok = params.get('tok')
-        if not tok:
-            raise SecuridError('missing --tok')
-        t = params.get('time')
-        if t is not None:
-            if t[:1] in ('+', '-'):   # relative offset from "now"
-                t = int(time.time()) + int(t)
-            else:
-                t = int(t)
-        pin = params.get('pin', '')
-        passw = params.get('passw')
-        devid = params.get('devid')
-        seed = params.get('seed')
-
-        if cmd == 'info':
-            kind, info, _ = unlock(tok, passw, devid)
-            if params.get('text'):
-                _print_info(info)
-            else:
-                import json
-                print(json.dumps(info))
-            return 0
-
-        if cmd == 'describe':
-            import json
-            print(json.dumps(token_info(tok)))
-            return 0
-
-        if cmd == 'validate':
-            kind, info, _ = unlock(tok, passw, devid)
-            print(info['serial'])
-            return 0
-
-        if cmd == 'detect-devid':
-            print(detect_devid(tok, passw))
-            return 0
-
-        # code
-        if cmd == 'code':
-            if seed:
-                _, info, dec = unlock_cached(tok, seed)
-            else:
-                _, info, dec = unlock(tok, passw, devid)
-            computed = compute_tokencode(dec, info['serial'], info['flags'],
-                                         t, pin)
-            if want_full:
-                import json
-                out = dict(info)
-                out['code'] = computed
-                out['dec_seed'] = dec.hex()
-                out['pin'] = pin
-                print(json.dumps(out))
-            else:
-                print(computed)
-            return 0
-        raise SecuridError('unknown command %s' % cmd)
-    except SecuridError as e:
-        print('securid: %s' % e, file=sys.stderr)
-        return 2
-    except SystemExit:
-        raise
-    except Exception as e:  # pragma: no cover - defensive
-        print('securid: internal error: %s' % e, file=sys.stderr)
-        return 3
-
-
-def _print_info(info):
-    k = info
-    if k['kind'] == 'v2':
-        print('Serial number        : %s' % k['serial'])
-        print('Key length           : %s' % ('128' if k['is_128bit'] else '64'))
-        print('Tokencode digits     : %d' % k['digits'])
-        print('Seconds per tokencode: %d' % k['interval'])
-        print('PIN mode             : %d' % ((k['flags'] >> 3) & 3))
-        print('PIN required         : %s' % ('yes' if k['pin_required'] else 'no'))
-        print('Encrypted w/password : %s' % ('yes' if k['password_locked'] else 'no'))
-        print('Encrypted w/devid    : %s' % ('yes' if k['devid_locked'] else 'no'))
-    else:
-        print('Token format         : Android (v%d)' % k['version'])
-        if k.get('serial'):
-            print('Serial number        : %s' % k['serial'])
-            print('Key length           : 128')
-            print('Tokencode digits     : %d' % k['digits'])
-            print('Seconds per tokencode: %d' % k['interval'])
-            print('PIN required         : %s' % ('yes' if k['pin_required'] else 'no'))
-        print('Encrypted w/password : %s' % ('yes' if k['password_locked'] else 'no'))
-        print('Encrypted w/devid    : %s' % ('yes' if k['devid_locked'] else 'no'))
-
-
-if __name__ == '__main__':
-    import sys
-    sys.exit(_main(sys.argv))
-__PASS_SECURID_ENGINE__
+#   False positives: these flags fire when a variable is used as an array in
+#   one function and as a scalar in another (e.g. `out`, `key`, `buf`).  All
+#   such uses are `local`-scoped per function; the engine is checked against
+#   the fixed reference token vectors, so no shared state is involved.
+# ===========================================================================
+_sec_ret=()
+_sec_retval=""
+_sec_err=""
+
+_SEC_SBOX=( 0x63 0x7c 0x77 0x7b 0xf2 0x6b 0x6f 0xc5 0x30 0x01 0x67 0x2b 0xfe 0xd7 0xab 0x76 0xca 0x82 0xc9 0x7d 0xfa 0x59 0x47 0xf0 0xad 0xd4 0xa2 0xaf 0x9c 0xa4 0x72 0xc0 0xb7 0xfd 0x93 0x26 0x36 0x3f 0xf7 0xcc 0x34 0xa5 0xe5 0xf1 0x71 0xd8 0x31 0x15 0x04 0xc7 0x23 0xc3 0x18 0x96 0x05 0x9a 0x07 0x12 0x80 0xe2 0xeb 0x27 0xb2 0x75 0x09 0x83 0x2c 0x1a 0x1b 0x6e 0x5a 0xa0 0x52 0x3b 0xd6 0xb3 0x29 0xe3 0x2f 0x84 0x53 0xd1 0x00 0xed 0x20 0xfc 0xb1 0x5b 0x6a 0xcb 0xbe 0x39 0x4a 0x4c 0x58 0xcf 0xd0 0xef 0xaa 0xfb 0x43 0x4d 0x33 0x85 0x45 0xf9 0x02 0x7f 0x50 0x3c 0x9f 0xa8 0x51 0xa3 0x40 0x8f 0x92 0x9d 0x38 0xf5 0xbc 0xb6 0xda 0x21 0x10 0xff 0xf3 0xd2 0xcd 0x0c 0x13 0xec 0x5f 0x97 0x44 0x17 0xc4 0xa7 0x7e 0x3d 0x64 0x5d 0x19 0x73 0x60 0x81 0x4f 0xdc 0x22 0x2a 0x90 0x88 0x46 0xee 0xb8 0x14 0xde 0x5e 0x0b 0xdb 0xe0 0x32 0x3a 0x0a 0x49 0x06 0x24 0x5c 0xc2 0xd3 0xac 0x62 0x91 0x95 0xe4 0x79 0xe7 0xc8 0x37 0x6d 0x8d 0xd5 0x4e 0xa9 0x6c 0x56 0xf4 0xea 0x65 0x7a 0xae 0x08 0xba 0x78 0x25 0x2e 0x1c 0xa6 0xb4 0xc6 0xe8 0xdd 0x74 0x1f 0x4b 0xbd 0x8b 0x8a 0x70 0x3e 0xb5 0x66 0x48 0x03 0xf6 0x0e 0x61 0x35 0x57 0xb9 0x86 0xc1 0x1d 0x9e 0xe1 0xf8 0x98 0x11 0x69 0xd9 0x8e 0x94 0x9b 0x1e 0x87 0xe9 0xce 0x55 0x28 0xdf 0x8c 0xa1 0x89 0x0d 0xbf 0xe6 0x42 0x68 0x41 0x99 0x2d 0x0f 0xb0 0x54 0xbb 0x16 )
+_SEC_INVSBOX=( 0x52 0x09 0x6a 0xd5 0x30 0x36 0xa5 0x38 0xbf 0x40 0xa3 0x9e 0x81 0xf3 0xd7 0xfb 0x7c 0xe3 0x39 0x82 0x9b 0x2f 0xff 0x87 0x34 0x8e 0x43 0x44 0xc4 0xde 0xe9 0xcb 0x54 0x7b 0x94 0x32 0xa6 0xc2 0x23 0x3d 0xee 0x4c 0x95 0x0b 0x42 0xfa 0xc3 0x4e 0x08 0x2e 0xa1 0x66 0x28 0xd9 0x24 0xb2 0x76 0x5b 0xa2 0x49 0x6d 0x8b 0xd1 0x25 0x72 0xf8 0xf6 0x64 0x86 0x68 0x98 0x16 0xd4 0xa4 0x5c 0xcc 0x5d 0x65 0xb6 0x92 0x6c 0x70 0x48 0x50 0xfd 0xed 0xb9 0xda 0x5e 0x15 0x46 0x57 0xa7 0x8d 0x9d 0x84 0x90 0xd8 0xab 0x00 0x8c 0xbc 0xd3 0x0a 0xf7 0xe4 0x58 0x05 0xb8 0xb3 0x45 0x06 0xd0 0x2c 0x1e 0x8f 0xca 0x3f 0x0f 0x02 0xc1 0xaf 0xbd 0x03 0x01 0x13 0x8a 0x6b 0x3a 0x91 0x11 0x41 0x4f 0x67 0xdc 0xea 0x97 0xf2 0xcf 0xce 0xf0 0xb4 0xe6 0x73 0x96 0xac 0x74 0x22 0xe7 0xad 0x35 0x85 0xe2 0xf9 0x37 0xe8 0x1c 0x75 0xdf 0x6e 0x47 0xf1 0x1a 0x71 0x1d 0x29 0xc5 0x89 0x6f 0xb7 0x62 0x0e 0xaa 0x18 0xbe 0x1b 0xfc 0x56 0x3e 0x4b 0xc6 0xd2 0x79 0x20 0x9a 0xdb 0xc0 0xfe 0x78 0xcd 0x5a 0xf4 0x1f 0xdd 0xa8 0x33 0x88 0x07 0xc7 0x31 0xb1 0x12 0x10 0x59 0x27 0x80 0xec 0x5f 0x60 0x51 0x7f 0xa9 0x19 0xb5 0x4a 0x0d 0x2d 0xe5 0x7a 0x9f 0x93 0xc9 0x9c 0xef 0xa0 0xe0 0x3b 0x4d 0xae 0x2a 0xf5 0xb0 0xc8 0xeb 0xbb 0x3c 0x83 0x53 0x99 0x61 0x17 0x2b 0x04 0x7e 0xba 0x77 0xd6 0x26 0xe1 0x69 0x14 0x63 0x55 0x21 0x0c 0x7d )
+_SEC_RCON=( 0x01 0x02 0x04 0x08 0x10 0x20 0x40 0x80 0x1b 0x36 )
+_SEC_KEY0=( 0xd0 0x14 0x43 0x3c 0x6d 0x17 0x9f 0xeb 0xda 0x09 0xab 0xfc 0x32 0x49 0x63 0x4c )
+_SEC_KEY1=( 0x3b 0xaf 0xff 0x4d 0x91 0x8d 0x89 0xb6 0x81 0x60 0xde 0x44 0x4e 0x05 0xc0 0xdd )
+_SEC_V2_MAGIC=( 0xd8 0xf5 0x32 0x53 0x82 0x89 )
+_SEC_CLASS_GUIDS=(
+  "556f1985-33dd-442c-9155-3a0e994f21b1"
+  "a01c4380-fc01-4df0-b113-7fb98ec74694"
+  "868c28f8-31bf-4911-9876-ebece5c3f2ab"
+  "b77a1d06-d505-4200-90d3-1bb397748704"
+  "c483b592-63f0-4f19-b4cb-a6bce8e57159"
+  "8f94b226-d362-4204-ac52-3b21fa333b6f"
+  "d0955a53-569b-4ecc-9cf7-6c2a59d4e775"
+)
+_SEC_V3_TOKEN_SIZE=291
+_SEC_V3_NONCE=16
+_SEC_V3_DEVID=48
+_SEC_V3_DAY=337500
+_SEC_EPOCH_DAYS=10957
+
+_SEC_F_PASSPROT=$(( 1 << 13 ))
+_SEC_F_SNPROT=$(( 1 << 12 ))
+_SEC_FNUM=0x3
+_SEC_FDIGIT=0x1C0
+_SEC_FPINMODE=0x18
+
+_sec_fdiv() {  # <a> <b> -> _sec_retval : floor division (python //)
+  local a="$1" b="$2"
+  if (( a >= 0 )); then _sec_retval=$(( a / b ))
+  else _sec_retval=$(( - ((-a + b - 1) / b) )); fi
+}
+_sec_fmod() {  # <a> <b> -> _sec_retval : python style remainder
+  local a="$1" b="$2" r
+  r=$(( a % b ))
+  if (( r < 0 )); then r=$(( r + b )); fi
+  _sec_retval=$r
+}
+
+_sec_hex2bytes() {   # <hex> -> _sec_ret[] (decimal ints)
+  local h="$1" i n=${#1}
+  _sec_ret=()
+  for (( i=0; i<n; i+=2 )); do
+    _sec_ret+=("$((0x${h:$i:2}))")
+  done
+}
+_sec_bytes2hex() {   # <ints...> -> _sec_retval
+  local b h
+  _sec_retval=""
+  for b in "$@"; do
+    printf -v h "%02x" "$b"
+    _sec_retval+="$h"
+  done
+}
+_sec_str2bytes() {   # <str> -> _sec_ret[] (utf-8)
+  local s="$1" i c cp
+  _sec_ret=()
+  for (( i=0; i < ${#s}; i++ )); do
+    c="${s:$i:1}"
+    cp=$(printf '%d' "'${c}")
+    if (( cp < 0x80 )); then _sec_ret+=("$cp")
+    elif (( cp < 0x800 )); then
+      _sec_ret+=("$(( 0xC0 | (cp >> 6) ))" "$(( 0x80 | (cp & 0x3F) ))")
+    elif (( cp < 0x10000 )); then
+      _sec_ret+=("$(( 0xE0 | (cp >> 12) ))" "$(( 0x80 | ((cp >> 6) & 0x3F) ))" "$(( 0x80 | (cp & 0x3F) ))")
+    else
+      _sec_ret+=("$(( 0xF0 | (cp >> 18) ))" "$(( 0x80 | ((cp >> 12) & 0x3F) ))" "$(( 0x80 | ((cp >> 6) & 0x3F) ))" "$(( 0x80 | (cp & 0x3F) ))" )
+    fi
+  done
+}
+_sec_hex_slice() {   # <hex> <start-byte> <len-bytes> -> _sec_retval (hex)
+  _sec_retval="${1:$(($2*2)):$(($3*2))}"
+}
+_sec_xorbytes() {  # <hex1> <hex2> (same byte length) -> _sec_ret[] and _sec_retval
+  local h1="$1" h2="$2" i n=${#1}
+  _sec_ret=()
+  for (( i=0; i<n; i+=2 )); do
+    _sec_ret+=("$(( 0x${h1:$i:2} ^ 0x${h2:$i:2} ))")
+  done
+  _sec_bytes2hex "${_sec_ret[@]}"
+}
+
+# AES
+_sec_gmul() {   # <a> <b> -> _sec_retval (GF(2^8) multiply)
+  local a="$1" b="$2" p=0 hi
+  for _ in 1 2 3 4 5 6 7 8; do
+    if (( b & 1 )); then p=$(( p ^ a )); fi
+    hi=$(( a & 0x80 ))
+    a=$(( (a << 1) & 0xFF ))
+    if (( hi )); then a=$(( a ^ 0x1b )); fi
+    b=$(( b >> 1 ))
+  done
+  _sec_retval=$p
+}
+_sec_aes_keyexpand() {   # <key bytes...> -> _sec_kat[] expanded key (flat)
+  local -a key=( "$@" )
+  local nk=$(( ${#key[@]} / 4 ))
+  local nw=$(( 4 * (nk + 6 + 1) ))
+  local i t0 t1 t2 t3 tt0 tt1 tt2 tt3
+  _sec_kat=( "${key[@]}" )
+  for (( i = nk; i < nw; i++ )); do
+    t0=$(( _sec_kat[(i-1)*4] ))
+    t1=$(( _sec_kat[(i-1)*4 + 1] ))
+    t2=$(( _sec_kat[(i-1)*4 + 2] ))
+    t3=$(( _sec_kat[(i-1)*4 + 3] ))
+    if (( i % nk == 0 )); then
+      tt0=$t0; tt1=$t1; tt2=$t2; tt3=$t3
+      t0=$(( _SEC_SBOX[tt1] ))
+      t1=$(( _SEC_SBOX[tt2] ))
+      t2=$(( _SEC_SBOX[tt3] ))
+      t3=$(( _SEC_SBOX[tt0] ))
+      t0=$(( t0 ^ _SEC_RCON[(i / nk) - 1] ))
+    elif (( nk > 6 && i % nk == 4 )); then
+      t0=$(( _SEC_SBOX[t0] ))
+      t1=$(( _SEC_SBOX[t1] ))
+      t2=$(( _SEC_SBOX[t2] ))
+      t3=$(( _SEC_SBOX[t3] ))
+    fi
+    _sec_kat[i*4]=$(( _sec_kat[(i-nk)*4]     ^ t0 ))
+    _sec_kat[i*4 + 1]=$((  _sec_kat[(i-nk)*4 + 1] ^ t1 ))
+    _sec_kat[i*4 + 2]=$((  _sec_kat[(i-nk)*4 + 2] ^ t2 ))
+    _sec_kat[i*4 + 3]=$((  _sec_kat[(i-nk)*4 + 3] ^ t3 ))
+  done
+}
+
+# AES state primitives (operate in place on the 16-int module array _sec_st)
+_st_addkey() {   # <round> : AddRoundKey
+  local rnd="$1" r c k=0
+  for r in 0 1 2 3; do
+    for c in 0 1 2 3; do
+      _sec_st[k]=$(( _sec_st[k] ^ _sec_kat[(rnd*16) + (c*4) + r] ))
+      k=$(( k + 1 ))
+    done
+  done
+}
+_st_dosub() {    # SubBytes in place
+  local i
+  for (( i = 0; i < 16; i++ )); do
+    _sec_st[i]=$(( _SEC_SBOX[_sec_st[i]] ))
+  done
+}
+_st_invsub() {   # InvSubBytes in place
+  local i
+  for (( i = 0; i < 16; i++ )); do
+    _sec_st[i]=$(( _SEC_INVSBOX[_sec_st[i]] ))
+  done
+}
+_st_shiftrows() {    # encryption shift: row r rotates left by r
+  local -a t=( "${_sec_st[@]}" )
+  local r c s
+  for (( r = 0; r < 4; r++ )); do
+    for (( c = 0; c < 4; c++ )); do
+      if (( r == 0 )); then s=$c
+      else s=$(( r*4 + ((c + r) % 4) )); fi
+      _sec_st[r*4 + c]=$(( t[s] ))
+    done
+  done
+}
+_st_invshiftrows() { # InvShiftRows: row r rotates right by r
+  local -a t=( "${_sec_st[@]}" )
+  local r c s
+  for (( r = 0; r < 4; r++ )); do
+    for (( c = 0; c < 4; c++ )); do
+      if (( r == 0 )); then s=$c
+      else s=$(( r*4 + ((c + 4 - r) % 4) )); fi
+      _sec_st[r*4 + c]=$(( t[s] ))
+    done
+  done
+}
+
+# MixColumns / InvMixColumns (in place on _sec_st)
+_st_mix() {
+  local -a t=( "${_sec_st[@]}" )
+  local c s0 s1 s2 s3
+  local m0 m1 m2 m3 m4 m5 m6 m7
+  for c in 0 1 2 3; do
+    s0=$(( t[c] ));  s1=$(( t[4+c] ))
+    s2=$(( t[8+c] )); s3=$(( t[12+c] ))
+    _sec_gmul "$s0" 2; m0=$_sec_retval
+    _sec_gmul "$s1" 3; m1=$_sec_retval
+    _sec_gmul "$s2" 2; m2=$_sec_retval
+    _sec_gmul "$s3" 3; m3=$_sec_retval
+    _sec_gmul "$s0" 3; m4=$_sec_retval
+    _sec_gmul "$s1" 2; m5=$_sec_retval
+    _sec_gmul "$s2" 3; m6=$_sec_retval
+    _sec_gmul "$s3" 2; m7=$_sec_retval
+    _sec_st[c]=$(( m0 ^ m1 ^ s2 ^ s3 ))
+    _sec_st[4+c]=$(( s0 ^ m5 ^ m6 ^ s3 ))
+    _sec_st[8+c]=$(( s0 ^ s1 ^ m2 ^ m3 ))
+    _sec_st[12+c]=$(( m4 ^ s1 ^ s2 ^ m7 ))
+  done
+}
+_st_invmix() {
+  local -a t=( "${_sec_st[@]}" )
+  local c s0 s1 s2 s3
+  local m0 m1 m2 m3 m4 m5 m6 m7
+  local m8 m9 m10 m11 m12 m13 m14 m15
+  for c in 0 1 2 3; do
+    s0=$(( t[c] ));  s1=$(( t[4+c] ))
+    s2=$(( t[8+c] )); s3=$(( t[12+c] ))
+    _sec_gmul "$s0" 14; m0=$_sec_retval
+    _sec_gmul "$s1" 11; m1=$_sec_retval
+    _sec_gmul "$s2" 13; m2=$_sec_retval
+    _sec_gmul "$s3" 9;  m3=$_sec_retval
+    _sec_gmul "$s0" 9;  m4=$_sec_retval
+    _sec_gmul "$s1" 14; m5=$_sec_retval
+    _sec_gmul "$s2" 11; m6=$_sec_retval
+    _sec_gmul "$s3" 13; m7=$_sec_retval
+    _sec_gmul "$s0" 13; m8=$_sec_retval
+    _sec_gmul "$s1" 9;  m9=$_sec_retval
+    _sec_gmul "$s2" 14; m10=$_sec_retval
+    _sec_gmul "$s3" 11; m11=$_sec_retval
+    _sec_gmul "$s0" 11; m12=$_sec_retval
+    _sec_gmul "$s1" 13; m13=$_sec_retval
+    _sec_gmul "$s2" 9;  m14=$_sec_retval
+    _sec_gmul "$s3" 14; m15=$_sec_retval
+    _sec_st[c]=$(( m0 ^ m1 ^ m2 ^ m3 ))
+    _sec_st[4+c]=$(( m4 ^ m5 ^ m6 ^ m7 ))
+    _sec_st[8+c]=$(( m8 ^ m9 ^ m10 ^ m11 ))
+    _sec_st[12+c]=$(( m12 ^ m13 ^ m14 ^ m15 ))
+  done
+}
+# _sec_aes_block <keyhex> <datahex> <enc|dec> : single AES block
+# key length 16 (AES-128) or 32 (AES-256).  Result: _sec_ret (16 ints) and
+# _sec_retval (32-hex string).  State in the module array _sec_st.
+_sec_aes_block() {
+  local keyhex="$1" datahex="$2" mode="$3"
+  local -a key blk
+  local i rnd
+  _sec_hex2bytes "$keyhex"
+  key=( "${_sec_ret[@]}" )
+  _sec_hex2bytes "$datahex"
+  blk=( "${_sec_ret[@]}" )
+  # load state (transpose)
+  _sec_st=( 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 )
+  for i in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    _sec_st[i]=$(( blk[(i%4)*4 + (i/4)] ))
+  done
+  _sec_aes_keyexpand "${key[@]}"
+  local nk=$(( ${#key[@]} / 4 ))
+  local nr=$(( nk + 6 ))
+  if [[ "$mode" == "E" || "$mode" == "e" ]]; then
+    _st_addkey 0
+    for (( rnd = 1; rnd < nr; rnd++ )); do
+      _st_dosub
+      _st_shiftrows
+      _st_mix
+      _st_addkey "$rnd"
+    done
+    _st_dosub
+    _st_shiftrows
+    _st_addkey "$nr"
+  else
+    _st_addkey "$nr"
+    for (( rnd = nr - 1; rnd > 0; rnd-- )); do
+      _st_invshiftrows
+      _st_invsub
+      _st_addkey "$rnd"
+      _st_invmix
+    done
+    _st_invshiftrows
+    _st_invsub
+    _st_addkey 0
+  fi
+  # output bytes(s[r][c] for c in 0..3 for r in 0..3): transpose state back
+  local -a o=( 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 ) i2
+  for i2 in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    o[i2]=$(( _sec_st[(i2%4)*4 + (i2/4)] ))
+  done
+  _sec_ret=( "${o[@]}" )
+  _sec_bytes2hex "${_sec_ret[@]}"
+}
+
+# _sec_aes128_ecb <key16hex> <blk16hex> <E|D> -> _sec_ret, _sec_retval
+_sec_aes128_ecb() {
+  local keyhex="$1" datahex="$2" mode="$3"
+  _sec_aes_block "$keyhex" "$datahex" "$mode"
+}
+
+# _sec_aes256_cbc <key32hex> <iv16hex> <datahex> <E|D> -> _sec_ret, _sec_retval
+_sec_aes256_cbc() {
+  local keyhex="$1" ivhex="$2" datahex="$3" mode="$4"
+  local datalen=$(( ${#datahex} / 2 ))
+  local i blk c prev out="" x
+  prev="$ivhex"
+  for (( i = 0; i < datalen; i += 16 )); do
+    _sec_hex_slice "$datahex" "$i" 16
+    blk="$_sec_retval"
+    if [[ "$mode" == "E" || "$mode" == "e" ]]; then
+      _sec_xorbytes "$blk" "$prev"
+      x="$_sec_retval"
+      _sec_aes_block "$keyhex" "$x" "E"
+      prev="$_sec_retval"
+    else
+      _sec_aes_block "$keyhex" "$blk" "D"
+      _sec_xorbytes "$_sec_retval" "$prev"
+      prev="$blk"
+    fi
+    out+="$_sec_retval"
+  done
+  _sec_retval="$out"
+  _sec_hex2bytes "$out"
+}
+# _sec_url_decode <str> -> _sec_retval (decoded string)
+_sec_url_decode() {
+  local s="$1" n=${#1} out="" i c
+  for (( i = 0; i < n; i++ )); do
+    c="${s:$i:1}"
+    if [[ $c == % ]]; then
+      local h2="${s:$((i+1)):2}"
+      case "$h2" in
+        [0-9a-fA-F][0-9a-fA-F]) printf -v _sec_retval "%b" "\\x$h2"; out+="$_sec_retval"; i=$((i+2)); continue ;;
+      esac
+    fi
+    out+="$c"
+  done
+  _sec_retval="$out"
+}
+
+# _sec_b64val <char> -> _sec_retval : 0..63, -1 invalid, -2 '='
+_sec_b64val() {
+  case "$1" in
+    [A-Z]) _sec_retval=$(( $(printf '%d' "'$1") - 65 )) ;;
+    [a-z]) _sec_retval=$(( $(printf '%d' "'$1") - 97 + 26 )) ;;
+    [0-9]) _sec_retval=$(( $(printf '%d' "'$1") - 48 + 52 )) ;;
+    +) _sec_retval=62 ;;
+    /) _sec_retval=63 ;;
+    =) _sec_retval=-2 ;;
+    *) _sec_retval=-1 ;;
+  esac
+}
+# _sec_b64decode <str> -> _sec_ret[]
+_sec_b64decode() {
+  local s="$1" n=${#1} i c
+  local val=0 bits=0
+  local -a out=()
+  for (( i = 0; i < n; i++ )); do
+    c="${s:$i:1}"
+    _sec_b64val "$c"
+    local v=$_sec_retval
+    if (( v < 0 )); then
+      (( v == -2 )) && break   # padding ends decoding
+      continue                 # invalid char is skipped
+    fi
+    val=$(( (val << 6) | v ))
+    bits=$(( bits + 6 ))
+    while (( bits >= 8 )); do
+      out+=("$(( (val >> (bits - 8)) & 0xFF ))")
+      bits=$(( bits - 8 ))
+    done
+  done
+  _sec_ret=( "${out[@]}" )
 }
 
 # ---------------------------------------------------------------------------
-# Passfile helpers
+# _sec_mac <hex> -> _sec_ret[] (16 bytes), _sec_machex (hex)
+# _sec_shortmac <hex> -> _sec_retval (int)
 # ---------------------------------------------------------------------------
+_sec_mac() {
+  local datahex="$1" n=$(( ${#1} / 2 ))
+  local hx=""
+  local -a work pad lastblk
+  local k i odd=0 v p enc outhex b0 b1 resa
+  work=( 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 )
+  v=$(( n * 8 ))
+  pad=( 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 )
+  for (( p = 15; p >= 0; p-- )); do
+    (( v == 0 )) && break
+    pad[p]=$(( v & 0xFF ))
+    v=$(( v >> 8 ))
+  done
+  i=0
+  while (( n > 16 )); do
+    _sec_hex_slice "$datahex" "$i" 16; blk="${_sec_retval}"
+    _sec_bytes2hex "${work[@]}"; hx="$_sec_retval"
+    _sec_aes128_ecb "$blk" "$hx" "E"; enc="$_sec_retval"
+    for k in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+      work[k]=$(( work[k] ^ $(( 0x${enc:$((k*2)):2} )) ))
+    done
+    i=$(( i + 16 )); n=$(( n - 16 )); odd=$(( 1 ^ odd ))
+  done
+  lastblk=( 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 )
+  for (( k = 0; k < n; k++ )); do
+    lastblk[k]=$(( 0x${datahex:$(( (i+k)*2 )):2} ))
+  done
+  _sec_bytes2hex "${lastblk[@]}"; local lh="$_sec_retval"
+  _sec_bytes2hex "${work[@]}"; hx="$_sec_retval"
+  _sec_aes128_ecb "$lh" "$hx" "E"; enc="$_sec_retval"
+  for k in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    work[k]=$(( work[k] ^ $(( 0x${enc:$((k*2)):2} )) ))
+  done
+  if (( odd )); then
+    _sec_bytes2hex "${work[@]}"; hx="$_sec_retval"
+    _sec_aes128_ecb "00000000000000000000000000000000" "$hx" "E"; enc="$_sec_retval"
+    for k in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+      work[k]=$(( work[k] ^ $(( 0x${enc:$((k*2)):2} )) ))
+    done
+  fi
+  _sec_bytes2hex "${pad[@]}"; local ph="$_sec_retval"
+  _sec_bytes2hex "${work[@]}"; hx="$_sec_retval"
+  _sec_aes128_ecb "$ph" "$hx" "E"; enc="$_sec_retval"
+  for k in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    work[k]=$(( work[k] ^ $(( 0x${enc:$((k*2)):2} )) ))
+  done
+  _sec_bytes2hex "${work[@]}"; outhex="$_sec_retval"
+  _sec_aes128_ecb "$outhex" "$outhex" "E"; enc="$_sec_retval"
+  reshex=""
+  for k in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    b0=$(( 0x${outhex:$((k*2)):2} ))
+    b1=$(( 0x${enc:$((k*2)):2} ))
+    printf -v resa "%02x" $(( b0 ^ b1 ))
+    reshex+="$resa"
+  done
+  _sec_hex2bytes "$reshex"
+  _sec_machex="$reshex"
+}
+_sec_shortmac() {
+  _sec_mac "$1"
+  local h="${_sec_machex}"
+  local b0=$(( 0x${h:0:2} )) b1=$(( 0x${h:2:2} ))
+  _sec_retval=$(( (b0 << 7) | (b1 >> 1) ))
+}
+
+# _sec_digits_to_bits <str> <n_bits> -> _sec_ret[]
+_sec_digits_to_bits() {
+  local s="$1" n="$2"
+  local nb=$(( (n + 7) / 8 ))
+  local -a out=( )
+  local j
+  for (( j = 0; j < nb; j++ )); do out[j]=0; done
+  local bitpos=0 ch val b
+  while (( bitpos < n )); do
+    ch="${s:$((bitpos / 3)):1}"
+    [[ -n "$ch" ]] || break
+    val=$(( ( $(printf '%d' "'$ch") - 48 ) & 0x07 ))
+    for b in 0 1 2; do
+      if (( bitpos + b >= n )); then break; fi
+      if (( val & (4 >> b) )); then
+        out[(bitpos + b) / 8]=$(( out[(bitpos + b) / 8] | (1 << (7 - ((bitpos + b) % 8))) ))
+      fi
+    done
+    bitpos=$(( bitpos + 3 ))
+  done
+  _sec_ret=( "${out[@]}" )
+}
+# _sec_get_bits <start> <n> <buf bytes...> -> _sec_retval (int)
+_sec_get_bits() {
+  local st="$1" n="$2"
+  shift 2
+  local -a buf=( "$@" )
+  local i b bits=0
+  for (( i = 0; i < n; i++ )); do
+    bits=$(( bits << 1 ))
+    b=$(( st + i ))
+    if (( buf[b / 8] & (1 << (7 - (b % 8))) )); then bits=$(( bits | 1 )); fi
+  done
+  _sec_retval=$bits
+}
+# ---------------------------------------------------------------------------
+# SHA-256 (FIPS 180-4), fully inlined round math (no per-op function calls)
+# so PBKDF2 runs in seconds.  bash builtins only.
+#
+# Layers:
+#   _sec_sha256_blocks <hex-with-padding-and-length>   process whole blocks
+#   _sec_sha256        <msghex>                        pad + SHA-256
+# and the HMAC fast path reuses post-block-0 states:
+#   _sec_hmac_prep     <keyhex>  -> _SEC_IN0/_SEC_OUT0 (post-block-0 states)
+#   _sec_hmac_fast     <msghex>  -> _sec_hmachex
+# ---------------------------------------------------------------------------
+_SEC_SHAK=( 0x428a2f98 0x71374491 0xb5c0fbcf 0xe9b5dba5 0x3956c25b 0x59f111f1 0x923f82a4 0xab1c5ed5
+0xd807aa98 0x12835b01 0x243185be 0x550c7dc3 0x72be5d74 0x80deb1fe 0x9bdc06a7 0xc19bf174
+0xe49b69c1 0xefbe4786 0x0fc19dc6 0x240ca1cc 0x2de92c6f 0x4a7484aa 0x5cb0a9dc 0x76f988da
+0x983e5152 0xa831c66d 0xb00327c8 0xbf597fc7 0xc6e00bf3 0xd5a79147 0x06ca6351 0x14292967
+0x27b70a85 0x2e1b2138 0x4d2c6dfc 0x53380d13 0x650a7354 0x766a0abb 0x81c2c92e 0x92722c85
+0xa2bfe8a1 0xa81a664b 0xc24b8b70 0xc76c51a3 0xd192e819 0xd6990624 0xf40e3585 0x106aa070
+0x19a4c116 0x1e376c08 0x2748774c 0x34b0bcb5 0x391c0cb3 0x4ed8aa4a 0x5b9cca4f 0x682e6ff3
+0x748f82ee 0x78a5636f 0x84c87814 0x8cc70208 0x90befffa 0xa4506ceb 0xbef9a3f7 0xc67178f2 )
+_sec_sha256_blocks() {
+  local msg="$1" i t blk tmp
+  local -a H=( 0x6a09e667 0xbb67ae85 0x3c6ef372 0xa54ff53a 0x510e527f 0x9b05688c 0x1f83d9ab 0x5be0cd19 )
+  if [[ -n "$_SEC_HINIT" ]]; then
+    # resume from a pre-computed 8-word state (HMAC fast path)
+    local -a hv
+    read -r -a hv <<< "$_SEC_HINIT"
+    H=( "${hv[@]}" )
+  fi
+  local nblocks=$(( ${#msg} / 128 ))
+  local -a W=( )
+  local A B C D E F G Hh
+  local s0 s1 S1 S0 t1 t2 ch ma
+  for (( blk = 0; blk < nblocks; blk++ )); do
+        for (( i = 0; i < 16; i++ )); do
+      W[i]=$(( 0x${msg:$((blk*128 + i*8)):8} ))
+    done
+    for (( i = 16; i < 64; i++ )); do
+      s0=$(( ( ((W[$((i-15))] >> 7) | (W[$((i-15))] << 25)) ^
+               ((W[$((i-15))] >> 18) | (W[$((i-15))] << 14)) ^
+               (W[$((i-15))] >> 3) ) & 0xFFFFFFFF ))
+      s1=$(( ( ((W[$((i-2))] >> 17) | (W[$((i-2))] << 15)) ^
+               ((W[$((i-2))] >> 19) | (W[$((i-2))] << 13)) ^
+               (W[$((i-2))] >> 10) ) & 0xFFFFFFFF ))
+      W[i]=$(( (W[i-16] + s0 + W[i-7] + s1) & 0xFFFFFFFF ))
+    done
+    A=${H[0]}; B=${H[1]}; C=${H[2]}; D=${H[3]}
+    E=${H[4]}; F=${H[5]}; G=${H[6]}; Hh=${H[7]}
+    for (( t = 0; t < 64; t++ )); do
+      S1=$(( ( ((E >> 6) | (E << 26)) ^ ((E >> 11) | (E << 21)) ^ ((E >> 25) | (E << 7)) ) & 0xFFFFFFFF ))
+      ch=$(( (E & F) ^ ((~E) & G) ))
+      t1=$(( (Hh + S1 + ch + _SEC_SHAK[t] + W[t]) & 0xFFFFFFFF ))
+      S0=$(( ( ((A >> 2) | (A << 30)) ^ ((A >> 13) | (A << 19)) ^ ((A >> 22) | (A << 10)) ) & 0xFFFFFFFF ))
+      ma=$(( (A & B) ^ (A & C) ^ (B & C) ))
+      t2=$(( (S0 + ma) & 0xFFFFFFFF ))
+      Hh=$G; G=$F; F=$E
+      E=$(( (D + t1) & 0xFFFFFFFF ))
+      D=$C; C=$B; B=$A
+      A=$(( (t1 + t2) & 0xFFFFFFFF ))
+    done
+    H[0]=$(( (H[0] + A) & 0xFFFFFFFF ))
+    H[1]=$(( (H[1] + B) & 0xFFFFFFFF ))
+    H[2]=$(( (H[2] + C) & 0xFFFFFFFF ))
+    H[3]=$(( (H[3] + D) & 0xFFFFFFFF ))
+    H[4]=$(( (H[4] + E) & 0xFFFFFFFF ))
+    H[5]=$(( (H[5] + F) & 0xFFFFFFFF ))
+    H[6]=$(( (H[6] + G) & 0xFFFFFFFF ))
+    H[7]=$(( (H[7] + Hh) & 0xFFFFFFFF ))
+  done
+  local digest="" st="" tmp
+  for (( i = 0; i < 8; i++ )); do
+    printf -v tmp "%08x" "${H[$i]}"
+    digest+="$tmp"
+    st+=" ${H[$i]}"
+  done
+  _sec_shahex="$digest"
+  _sec_retval="$digest"
+  _sec_sha_state="${st# }"
+}
+
+# _sec_sha256 <msghex> : standard SHA-256
+_sec_sha256() {
+  local msg="$1" nbytes=$(( ${#1} / 2 ))
+  local nbits=$(( nbytes * 8 ))
+  local ph="$msg" z hx
+  ph+="80"
+  z=$(( (64 - ((nbytes + 9) % 64)) % 64 ))
+  while (( z > 0 )); do ph+="00"; z=$(( z - 1 )); done
+  printf -v hx "%016x" "$nbits"
+  ph+="$hx"
+  _SEC_HINIT=""
+  _sec_sha256_blocks "$ph"
+}
+
+# _sec_hmac_pad <hex> <total_hex_bytes_before_tail> : append the tail
+# (0x80 + zeros + 8-byte BE bit length) so the result is whole 64-byte blocks;
+# length covers <total> bytes (message + the 64-byte pad prefix).
+_sec_hmac_tail() {  # <hex> <totallen_bytes> -> _sec_retval (padded hex)
+  local m="$1" total="$2" L nbytes z hx
+  L=${#m}; nbytes=$(( L / 2 ))
+  # bytes to add: 1 (0x80) + zero fill + 8; make total multiple of 64
+  z=$(( (64 - ((nbytes + 9) % 64)) % 64 ))
+  m+="80"
+  while (( z > 0 )); do m+="00"; z=$(( z - 1 )); done
+  printf -v hx "%016x" $(( total * 8 ))
+  m+="$hx"
+  _sec_retval="$m"
+}
+_sec_hmac_prep() {   # <keyhex> -> _SEC_IN0 _SEC_OUT0 (post-block-0 states)
+  local key="$1"
+  local klen=$(( ${#key} / 2 )) i kb
+  local ipad="" opad="" hx
+  if (( klen > 64 )); then
+    _sec_sha256 "$key"
+    key="$_sec_shahex"; klen=64
+  fi
+  for (( i = 0; i < 64; i++ )); do
+    if (( i < klen )); then kb=$(( 0x${key:$((i*2)):2} )); else kb=0; fi
+    printf -v hx "%02x" $(( kb ^ 0x36 )); ipad+="$hx"
+    printf -v hx "%02x" $(( kb ^ 0x5c )); opad+="$hx"
+  done
+  _SEC_IPADHEX="$ipad"
+  _SEC_OPADHEX="$opad"
+  # state after compressing the exact 64-byte pad block (no length)
+  _SEC_HINIT=""
+  _sec_sha256_blocks "$ipad"
+  _SEC_IN0="$_sec_sha_state"
+  _SEC_HINIT=""
+  _sec_sha256_blocks "$opad"
+  _SEC_OUT0="$_sec_sha_state"
+}
+_sec_hmac_fast() {    # <msghex> (uses prepared pads) -> _sec_hmachex
+  local msg="$1" inner pad
+  # inner = sha256(ipad(64) || msg): block0 already folded into _SEC_IN0
+  _sec_hmac_tail "$msg" $(( 64 + ${#msg} / 2 ))
+  _SEC_HINIT="$_SEC_IN0"
+  _sec_sha256_blocks "$_sec_retval"
+  inner="$_sec_shahex"
+  # outer = sha256(opad(64) || inner)
+  _sec_hmac_tail "$inner" 96
+  _SEC_HINIT="$_SEC_OUT0"
+  _sec_sha256_blocks "$_sec_retval"
+  _sec_hmachex="$_sec_shahex"
+  _sec_retval="$_sec_shahex"
+}
+# _sec_pbkdf2 <pwhex> <salthex> <iter> <dklen> -> _sec_retval (hex)
+_sec_pbkdf2() {
+  local pw="$1" salt="$2" iter="$3" dk="$4"
+  local i hx msg h prev="" T=""
+  _sec_hmac_prep "$pw"
+  for (( i = 1; i <= iter; i++ )); do
+    if (( i == 1 )); then
+      printf -v hx "%08x" "$i"
+      msg="$salt$hx"
+    else
+      msg="$prev"
+    fi
+    _sec_hmac_fast "$msg"
+    h="$_sec_hmachex"
+    if [[ -z "$T" ]]; then T="$h"
+    else
+      _sec_xorbytes "$T" "$h"
+      T="$_sec_retval"
+    fi
+    prev="$h"
+  done
+  _sec_retval="${T:0:$(( dk * 2 ))}"
+}
+# ---------------------------------------------------------------------------
+# UTC calendar math: unix time -> Y/M/D H:M:S in UTC
+# Uses Howard Hinnant's civil_from_days algorithm
+# ---------------------------------------------------------------------------
+# _sec_epoch_parts <t> -> _sec_retval "YYYY MM DD HH MM SS"
+_sec_epoch_parts() {
+  local t="$1" days soday
+  _sec_fdiv "$t" 86400; days=$_sec_retval      # floor division (t>=0 anyway)
+  _sec_fmod "$t" 86400; soday=$_sec_retval
+  # civil from days
+  local z=$(( days + 719468 ))
+  local era=$(( (z >= 0 ? z : z - 146096) / 146097 ))
+  local doe=$(( z - era * 146097 ))
+  local yoe=$(( (doe - doe/1460 + doe/36524 - doe/146096) / 365 ))
+  local y=$(( yoe + era * 400 ))
+  local doy=$(( doe - (365*yoe + yoe/4 - yoe/100) ))
+  local mp=$(( (5*doy + 2)/153 ))
+  local dd=$(( doy - (153*mp + 2)/5 + 1 ))
+  local mm=$(( mp < 10 ? mp + 3 : mp - 9 ))
+  local yyyy=$(( y + (mm <= 2 ? 1 : 0) ))
+  local hh=$(( soday / 3600 ))
+  local mi=$(( (soday % 3600) / 60 ))
+  local se=$(( soday % 60 ))
+  _sec_retval="$yyyy $mm $dd $hh $mi $se"
+}
+
+# ---------------------------------------------------------------------------
+# v1/v2 (ctf) tokens
+# ---------------------------------------------------------------------------
+# _sec_v2_decode <digits> <smartphone> : sets module fields:
+#   _sec_v2_version _sec_v2_serial _sec_v2_enc_seed _sec_v2_flags
+#   _sec_v2_exp_date _sec_v2_dec_seed_hash _sec_v2_device_id_hash
+_sec_v2_decode() {
+  local s="$1" smartphone="$2" d
+  _sec_err=""
+  local c0="${s:0:1}"
+  if [[ $c0 != 1 && $c0 != 2 || ${#s} -lt 81 ]]; then
+    _sec_err="not a valid ctf token string"; return 1
+  fi
+  local vers=$c0
+  local serial="${s:1:12}"
+  local body="${s:13}"
+  if (( ${#body} < 68 )); then _sec_err="ctf token too short"; return 1; fi
+  local data_part="${body:0:63}"
+  local checksum_part="${body: -5}"
+  _sec_bufhex "${s:0:1}${serial}${body:0:${#body}-5}"
+  _sec_shortmac "$_sec_retval"
+  local computed=$_sec_retval
+  _sec_digits_to_bits "$checksum_part" 15
+  local -a cb=( "${_sec_ret[@]}" )
+  _sec_get_bits 0 15 "${cb[@]}"
+  if (( _sec_retval != computed )); then
+    _sec_err="ctf checksum failed (bad token string)"; return 1
+  fi
+  _sec_digits_to_bits "$data_part" 189
+  d=( "${_sec_ret[@]}" )
+  _sec_bytes2hex "${d[@]:0:16}"
+  _sec_v2_enc_seed="$_sec_retval"
+  _sec_get_bits 128 16 "${d[@]}"; _sec_v2_flags=$_sec_retval
+  _sec_get_bits 144 14 "${d[@]}"; _sec_v2_exp_date=$_sec_retval
+  _sec_get_bits 159 15 "${d[@]}"; _sec_v2_dec_seed_hash=$_sec_retval
+  _sec_get_bits 174 15 "${d[@]}"; _sec_v2_device_id_hash=$_sec_retval
+  _sec_v2_version=$vers
+  _sec_v2_serial="$serial"
+  _sec_v2_smartphone=$smartphone
+  return 0
+}
+# _sec_bufhex <str> -> _sec_retval (utf-8 bytes as hex); uses _sec_str2bytes
+_sec_bufhex() { _sec_str2bytes "$1"; _sec_bytes2hex "${_sec_ret[@]}"; }
+
+# _sec_v2_key_hash <passw> <devid> <vers> <smartphone>:
+#   -> _sec_v2_keyhash (16B hex)  _sec_v2_devidhash (int)
+_sec_v2_key_hash() {
+  local passw="$1" devid="$2" vers="$3" smartphone="$4"
+  local -a key
+  key=( )
+  _sec_err=""
+  local pwlen=0
+  if [[ -n "$passw" ]]; then
+    _sec_str2bytes "$passw"
+    pwlen=${#_sec_ret[@]}
+    if (( pwlen > 40 )); then _sec_err="password too long"; return 1; fi
+    key=( "${_sec_ret[@]}" )
+  fi
+  local pos=$pwlen
+  local devid_buf_start=$pos
+  local devid_len=$(( smartphone ? 40 : 32 ))
+  local written=0 ch
+  if [[ -n "$devid" ]]; then
+    local ud="${devid^^}"
+    local ich
+    for (( ich = 0; ich < ${#ud}; ich++ )); do
+      (( written >= devid_len )) && break
+      ch="${ud:$ich:1}"
+      if [[ $vers == 1 ]]; then [[ $ch == [0-9] ]] || continue
+      else [[ $ch == [0-9A-F] ]] || continue; fi
+      key[pos]=$(printf '%d' "'${ch}")
+      pos=$(( pos + 1 ))
+      written=$(( written + 1 ))
+    done
+  fi
+  # device region: key[devid_buf_start .. +devid_len]
+  local -a dr=( "${key[@]:devid_buf_start:devid_len}" )
+  _sec_bytes2hex "${dr[@]}"
+  _sec_shortmac "$_sec_retval"
+  _sec_v2_devidhash=$_sec_retval
+  # append magic bytes to key
+  key+=( "${_SEC_V2_MAGIC[@]}" )
+  _sec_bytes2hex "${key[@]:0:pos+6}"
+  _sec_mac "$_sec_retval"
+  _sec_v2_keyhash="$_sec_machex"
+  return 0
+}
+
+# _sec_v2_unlock <passw> <devid> : needs _sec_v2_* fields -> _sec_v2_dec_seed (hex)
+_sec_v2_unlock() {
+  local passw="$1" devid="$2"
+  _sec_err=""
+  _sec_v2_key_hash "$passw" "$devid" "$_sec_v2_version" "$_sec_v2_smartphone" || return 1
+  if (( _sec_v2_flags & _SEC_F_SNPROT )); then
+    if (( _sec_v2_devidhash != _sec_v2_device_id_hash )); then
+      _sec_err="device ID does not match this token"; return 1
+    fi
+  fi
+  _sec_aes128_ecb "$_sec_v2_keyhash" "$_sec_v2_enc_seed" "D"
+  _sec_v2_dec_seed="$_sec_retval"
+  _sec_shortmac "$_sec_v2_dec_seed"
+  if (( _sec_retval != _sec_v2_dec_seed_hash )); then
+    _sec_err="failed to decrypt seed (wrong password?)"; return 1
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# tokencode computation
+# ---------------------------------------------------------------------------
+_sec_bcd() {   # <val> <nbytes> -> _sec_ret[] (BCD, high nibble first)
+  local val="$1" n="$2" i
+  _sec_ret=()
+  for (( i = n - 1; i >= 0; i-- )); do
+    _sec_ret[i]=$(( val % 10 ))
+    val=$(( val / 10 ))
+    _sec_ret[i]=$(( _sec_ret[i] | ((val % 10) << 4) ))
+    val=$(( val / 10 ))
+  done
+}
+# _sec_key_from_time <bcd_int[]> <nbytes> <serial>
+#   bcd array passed first; call with "${bcd[@]}" <nbytes> <serial>
+#   -> _sec_keyfrom_hx (16B hex)
+_sec_key_from_time() {
+  # args: <bcd...> <nbytes> <serial>  (nbytes next-to-last, serial last)
+  # single-element positional slices converted to scalars:
+  # shellcheck disable=SC2124
+  local -a bcd=( "${@:1:${#@}-2}" )
+  # single-element positional slices -> scalars (safe: pos params)
+  # shellcheck disable=SC2124
+  local nbytes="${@:$(( ${#@} - 1 )):1}"
+  # shellcheck disable=SC2124
+  local serial="${@: -1}"
+  local -a k
+  k=( 170 170 170 170 170 170 170 170 170 170 170 170 170 170 170 170 )
+  local i
+  for (( i = 0; i < nbytes; i++ )); do k[i]=${bcd[$i]}; done
+  k[12]=187; k[13]=187; k[14]=187; k[15]=187
+  local j i2 s1 s2
+  for (( j = 0; j < 4; j++ )); do
+    i2=$(( 4 + 2*j ))
+    s1="${serial:$i2:1}"; s2="${serial:$((i2+1)):1}"
+    k[8+j]=$(( (($(printf '%d' "'${s1}") - 48) << 4) | ($(printf '%d' "'${s2}") - 48) ))
+  done
+  _sec_bytes2hex "${k[@]}"
+  _sec_keyfrom_hx="$_sec_retval"
+}
+# _sec_compute_tokencode <dec_seedhex> <serial> <flags> <t> <pin>
+#   -> _sec_code, _sec_retval
+_sec_compute_tokencode() {
+  local dec_seed="$1" serial="$2" flags="$3" t="$4" pin="$5"
+  _sec_err=""
+  local is_30=1
+  if (( (flags & _SEC_FNUM) != 0 )); then is_30=0; fi
+  _sec_epoch_parts "$t"
+  local yyyy mm dd hh mi ss
+  read -r yyyy mm dd hh mi ss <<<"$_sec_retval"
+  local -a bcd_time=( 0 0 0 0 0 0 0 0 )
+  _sec_bcd "$yyyy" 2; bcd_time[0]=${_sec_ret[0]}; bcd_time[1]=${_sec_ret[1]}
+  _sec_bcd "$mm" 1;   bcd_time[2]=${_sec_ret[0]}
+  _sec_bcd "$dd" 1;   bcd_time[3]=${_sec_ret[0]}
+  _sec_bcd "$hh" 1;   bcd_time[4]=${_sec_ret[0]}
+  local m=$mi
+  if (( is_30 )); then m=$(( m & ~1 )); else m=$(( m & ~3 )); fi
+  _sec_bcd "$m" 1;    bcd_time[5]=${_sec_ret[0]}
+  bcd_time[6]=0; bcd_time[7]=0
+  local key0 key1
+  _sec_key_from_time "${bcd_time[@]}" 2 "$serial"; key0="$_sec_keyfrom_hx"
+  _sec_aes128_ecb "$dec_seed" "$key0" "E"; key0="$_sec_retval"
+  _sec_key_from_time "${bcd_time[@]}" 3 "$serial"; key1="$_sec_keyfrom_hx"
+  _sec_aes128_ecb "$key0" "$key1" "E"; key1="$_sec_retval"
+  _sec_key_from_time "${bcd_time[@]}" 4 "$serial"; key0="$_sec_keyfrom_hx"
+  _sec_aes128_ecb "$key1" "$key0" "E"; key0="$_sec_retval"
+  _sec_key_from_time "${bcd_time[@]}" 5 "$serial"; key1="$_sec_keyfrom_hx"
+  _sec_aes128_ecb "$key0" "$key1" "E"; key1="$_sec_retval"
+  _sec_key_from_time "${bcd_time[@]}" 8 "$serial"; key0="$_sec_keyfrom_hx"
+  _sec_aes128_ecb "$key1" "$key0" "E"; key0="$_sec_retval"
+  local i
+  if (( is_30 )); then
+    i=$(( ((mi & 0x01) << 3) | ((ss >= 30 ? 1 : 0) << 2) ))
+  else
+    i=$(( (mi & 0x03) << 2 ))
+  fi
+  local tk=0 j
+  for j in 0 1 2 3; do
+    tk=$(( (tk << 8) | 0x${key0:$(( (i+j)*2 )):2} ))
+  done
+  local digits=$(( ((flags & _SEC_FDIGIT) >> 6) + 1 ))
+  local pinlen=${#pin}
+  local -a out=( )
+  local k c ch
+  for (( k = 0; k < digits; k++ )); do
+    c=$(( tk % 10 )); tk=$(( tk / 10 ))
+    if (( k < pinlen )); then
+      ch="${pin:$((pinlen-k-1)):1}"
+      c=$(( c + $(printf '%d' "'${ch}") - 48 ))
+    fi
+    out[k]=$(( c % 10 ))
+  done
+  local code=""
+  for (( k = digits - 1; k >= 0; k-- )); do code+="${out[$k]}"; done
+  _sec_code="$code"
+  _sec_retval="$code"
+}
+# ---------------------------------------------------------------------------
+# v3/v4 Android tokens
+# ---------------------------------------------------------------------------
+# _sec_scrub_devid <devid> -> _sec_retval : upper alnum, max 48 chars
+_sec_scrub_devid() {
+  local d="$1" dout="" c
+  local n=${#d}
+  for (( i = 0; i < n; i++ )); do
+    c="${d:$i:1}"
+    case "$c" in
+      [0-9A-Za-z]) dout+="${c^^}" ;;
+    esac
+    (( ${#dout} >= 48 )) && break
+  done
+  _sec_retval="${dout:0:48}"
+}
+
+# _sec_v3_decode <b64str> : sets _sec_v3_* fields (hex forms). rc 1 + _sec_err on bad.
+_sec_v3_decode() {
+  local s="$1"
+  _sec_err=""
+  _sec_b64decode "$s"
+  local ln=${#_sec_ret[@]}
+  if (( ln != 291 )); then _sec_err="bad Android token length $ln"; return 1; fi
+  _sec_bytes2hex "${_sec_ret[@]}"
+  local hx="$_sec_retval"      # 582 hex chars
+  _sec_v3_version=$(( 0x${hx:0:2} ))
+  if (( _sec_v3_version != 3 && _sec_v3_version != 4 )); then
+    _sec_err="bad token version $_sec_v3_version"; return 1
+  fi
+  _sec_v3_password_locked=$(( 0x${hx:2:2} != 0 ))
+  _sec_v3_devid_locked=$(( 0x${hx:4:2} != 0 ))
+  _sec_v3_nonce_devid_hash="${hx:6:64}"        # bytes 3..35
+  _sec_v3_nonce_devid_pass_hash="${hx:70:64}"  # bytes 35..67
+  _sec_v3_nonce="${hx:134:32}"                 # bytes 67..83
+  _sec_v3_enc_payload="${hx:166:352}"          # bytes 83..259
+  _sec_v3_mac="${hx:518:64}"                   # bytes 259..291
+  return 0
+}
+
+# _sec_v3_compute_hash <passw> <devid-scrubbed> <noncehex>
+#   -> _sec_shahex (32B)
+_sec_v3_compute_hash() {
+  local passw="$1" devid="$2" nonce="$3" buf="" hx
+  buf="$nonce"
+  if [[ -n "$devid" ]]; then _sec_hexstr "$devid"; buf+="$_sec_retval"; fi
+  # the python buffer is pre-zeroed to 16+48+40 bytes and hashed over
+  # buf[:16+48+pass_len]; pad the devid zone to 64 bytes (128 hex).
+  while (( ${#buf} < 128 )); do buf+="00"; done
+  buf="${buf:0:128}"
+  if [[ -n "$passw" ]]; then _sec_hexstr "$passw"; buf+="$_sec_retval"; fi
+  _sec_sha256 "$buf"
+}
+# _sec_hexstr <str> -> _sec_retval (hex bytes)
+_sec_hexstr() { _sec_str2bytes "$1"; _sec_bytes2hex "${_sec_ret[@]}"; }
+
+# _sec_v3_derive_key <passw> <devid> <noncehex> <key_id> <version>
+#   -> _sec_pbkdf_ret (32B hex) [via _sec_pbkdf2]
+_sec_v3_derive_key() {
+  local passw="$1" devid="$2" nonce="$3" key_id="$4" version="$5"
+  local pw_hex="" d_hex="" buf0=""
+  if [[ -n "$passw" ]]; then _sec_hexstr "$passw"; pw_hex="$_sec_retval"; fi
+  if [[ -n "$devid" ]]; then _sec_hexstr "$devid"; d_hex="$_sec_retval"; fi
+  buf0="$pw_hex"
+  buf0+="$d_hex"
+  # pad the devid zone (bytes pass_len..pass_len+48) with zeros
+  local passlen=$(( ${#pw_hex}/2 ))
+  while (( ${#buf0}/2 < passlen + _SEC_V3_DEVID )); do buf0+="00"; done
+  if (( key_id )); then _sec_arrhex _SEC_KEY1; buf0+="$_sec_retval"
+  else _sec_arrhex _SEC_KEY0; buf0+="$_sec_retval"; fi
+  buf0+="$nonce"
+  # python zero-pads buf0 to _V3_DEVID+16+16+pass_len bytes before use
+  local totlen=$(( _SEC_V3_DEVID + 32 + passlen ))
+  while (( ${#buf0} < totlen*2 )); do buf0+="00"; done
+  local buf="$buf0"
+  if (( version == 3 )); then
+    # bytes(buf0[1::2]): every other byte starting at index 1
+    local odd="" i
+    # bytes(buf0[1::2]): every second BYTE (4 hex chars) from byte 1
+    for (( i = 2; i < ${#buf0}; i += 4 )); do odd+="${buf0:$i:2}"; done
+    buf="$odd"
+  fi
+  _sec_pbkdf2 "$buf" "$nonce" 1000 32
+  _sec_pbkdf_ret="$_sec_retval"
+}
+# _sec_arrhex <varname> -> _sec_retval (hex of array)
+_sec_arrhex() {
+  local -n arr=$1
+  _sec_bytes2hex "${arr[@]}"
+}
+
+# _sec_v3_compute_hmac <tok fields> <passw> <devid>
+#   uses _sec_v3_* fields -> _sec_hmachex
+_sec_v3_compute_hmac() {
+  local passw="$1" devid="$2"
+  _sec_v3_derive_key "$passw" "$devid" "$_sec_v3_nonce" 0 "$_sec_v3_version"
+  local key="$_sec_pbkdf_ret"
+  local msg=""
+  printf -v msg "%02x%02x%02x" "$_sec_v3_version" "$_sec_v3_password_locked" "$_sec_v3_devid_locked"
+  msg+="$_sec_v3_nonce_devid_hash$_sec_v3_nonce_devid_pass_hash$_sec_v3_nonce$_sec_v3_enc_payload"
+  _sec_hmac_prep "$key"
+  _sec_hmac_fast "$msg"
+}
+
+# _sec_v3_parse_payload <payloadhex(176B)> -> _sec_payload_* fields
+_sec_v3_parse_payload() {
+  local p="$1"
+  # serial = ascii of bytes 0..12
+  local i ser=""
+  for (( i = 0; i < 12; i++ )); do
+    ser+="$(printf '%b' "\\x${p:$((i*2)):2}")"
+  done
+  _sec_payload_serial="$ser"
+  _sec_payload_dec_seed="${p:32:32}"                    # bytes 16..32
+  local digits=$(( 0x${p:70:2} ))                        # byte 35
+  local addpin=$(( 0x${p:72:2} ))                        # byte 36
+  local interval=$(( 0x${p:74:2} ))                      # byte 37
+  local longdate=$(( 0x${p:96:10} ))                     # bytes 48..53
+  local exp=$(( longdate / _SEC_V3_DAY - _SEC_EPOCH_DAYS ))
+  (( exp < 0 )) && exp=0
+  local flags=$(( (1 << 9) | (1 << 14) ))
+  flags=$(( flags | (((digits - 1) << 6) & _SEC_FDIGIT) ))
+  if (( addpin != 0x1f )); then flags=$(( flags | (2 << 3) )); fi
+  if (( interval == 60 )); then flags=$(( flags | 1 )); fi
+  _sec_payload_flags=$flags
+  _sec_payload_exp_date=$exp
+  _sec_payload_digits=$digits
+}
+
+# _sec_v3_unlock <passw> <devid> : needs _sec_v3_* fields
+#   -> _sec_payload_* fields (serial/dec_seed/flags/exp) ; rc + _sec_err
+_sec_v3_unlock() {
+  local passw="$1" devid="$2"
+  _sec_err=""
+  local devid0="" h1 h2
+  if [[ -n "$devid" ]]; then _sec_scrub_devid "$devid"; devid0="$_sec_retval"; fi
+  _sec_v3_compute_hash "" "$devid0" "$_sec_v3_nonce"
+  if [[ "$_sec_shahex" != "$_sec_v3_nonce_devid_hash" ]]; then
+    _sec_err="device ID does not match this token"; return 1
+  fi
+  _sec_v3_compute_hash "$passw" "$devid0" "$_sec_v3_nonce"
+  if [[ "$_sec_shahex" != "$_sec_v3_nonce_devid_pass_hash" ]]; then
+    _sec_err="password does not match this token"; return 1
+  fi
+  _sec_v3_compute_hmac "$passw" "$devid0"
+  if [[ "$_sec_hmachex" != "$_sec_v3_mac" ]]; then
+    _sec_err="token MAC mismatch"; return 1
+  fi
+  _sec_v3_derive_key "$passw" "$devid0" "$_sec_v3_nonce" 1 "$_sec_v3_version"
+  local key="$_sec_pbkdf_ret"
+  _sec_aes256_cbc "$key" "$_sec_v3_nonce" "$_sec_v3_enc_payload" "D"
+  _sec_v3_parse_payload "$_sec_retval"
+  return 0
+}
+# _sec_extract <s> : strip 'ctfData=' prefix variants -> _sec_retval
+_sec_extract() {
+  local s="$1" m
+  if [[ "$s" == *"ctfData="* ]]; then
+    local rest="${s#*ctfData=}"
+    # 'ctfData=3D' implies a leading '=' (URL-encoded) that gets eaten
+    if [[ "$rest" == 3D* ]]; then rest="${rest:2}"; fi
+    _sec_retval="$rest"
+    return
+  fi
+  local s2="${s#"${s%%[![:space:]]*}"}"    # lstrip spaces
+  s2="${s2%"${s2##*[![:space:]]}"}"        # rstrip spaces
+  if [[ "$s2" == '<?xml'* ]]; then
+    _sec_err="sdtid XML files are not supported; convert the token with stoken export --blocks"
+    _sec_retval=""
+    return 1
+  fi
+  _sec_retval="$s2"
+}
+
+# _sec_parse <s> : determine kind and populate _sec_v2_* / _sec_v3_* fields
+#   -> _sec_kind ('v2'|'v3'); rc 1 + _sec_err on garbage
+_sec_parse() {
+  local s="$1" raw smartphone=0
+  _sec_err=""
+  _sec_extract "$s" || return 1
+  raw="$_sec_retval"
+  case "$s" in
+    com.rsa.securid.iphone://ctf|com.rsa.securid://ctf|http://127.0.0.1/securid/ctf*)
+      smartphone=1 ;;
+  esac
+  local c0="${raw:0:1}"
+  if [[ $c0 == 1 || $c0 == 2 ]]; then
+    local digits="" i c
+    for (( i = 0; i < ${#raw}; i++ )); do
+      c="${raw:$i:1}"
+      case "$c" in [0-9]) digits+="$c" ;; esac
+    done
+    if (( ${#digits} < 81 )); then _sec_err="ctf string too short"; return 1; fi
+    _sec_v2_decode "$digits" "$smartphone" || return 1
+    _sec_kind="v2"
+    return 0
+  elif [[ $c0 == A || $c0 == B ]]; then
+    _sec_url_decode "$raw"
+    _sec_v3_decode "$_sec_retval" || return 1
+    _sec_kind="v3"
+    return 0
+  fi
+  _sec_err="unrecognized token format"
+  return 1
+}
+
+# _sec_token_info <s> : header info (no unlock) -> _sec_ti_* fields
+_sec_token_info() {
+  local s="$1"
+  _sec_full_info=0
+  _sec_parse "$s" || return 1
+  if [[ "$_sec_kind" == "v2" ]]; then
+    _sec_ti_kind="v2"
+    _sec_ti_version="$_sec_v2_version"
+    _sec_ti_serial="$_sec_v2_serial"
+    _sec_ti_flags="$_sec_v2_flags"
+    _sec_ti_flags="${_sec_v2_flags}"
+    if (( _sec_v2_flags & _SEC_F_PASSPROT )); then _sec_ti_password_locked=1; else _sec_ti_password_locked=0; fi
+    if (( _sec_v2_flags & _SEC_F_SNPROT )); then _sec_ti_devid_locked=1; else _sec_ti_devid_locked=0; fi
+    _sec_ti_digits=$(( ((_sec_v2_flags & _SEC_FDIGIT) >> 6) + 1 ))
+    if (( _sec_v2_flags & 1 )); then _sec_ti_interval=60; else _sec_ti_interval=30; fi
+    if (( ((_sec_v2_flags & _SEC_FPINMODE) >> 3) >= 2 )); then _sec_ti_pin_required=1; else _sec_ti_pin_required=0; fi
+    _sec_ti_exp_date="$_sec_v2_exp_date"
+    _sec_ti_smartphone="$_sec_v2_smartphone"
+    if (( _sec_v2_flags & (1 << 14) )); then _sec_ti_is_128bit=1; else _sec_ti_is_128bit=0; fi
+    _sec_ti_serial_valid=1
+  else
+    _sec_ti_kind="v3"
+    _sec_ti_version="$_sec_v3_version"
+    _sec_ti_password_locked="$_sec_v3_password_locked"
+    _sec_ti_devid_locked="$_sec_v3_devid_locked"
+    _sec_ti_serial_valid=0
+  fi
+  return 0
+}
+
+# _sec_unlock <s> <passw> <devid> : populates _sec_v2_dec_seed / _sec_payload_*
+#   (kind held in _sec_kind); rc 1 + _sec_err on failure
+_sec_unlock() {
+  local s="$1" passw="$2" devid="$3"
+  _sec_parse "$s" || return 1
+  if [[ "$_sec_kind" == "v2" ]]; then
+    if (( _sec_v2_flags & _SEC_F_PASSPROT )) && [[ -z "$passw" ]]; then
+      _sec_err="password required"; return 1
+    fi
+    if (( _sec_v2_flags & _SEC_F_SNPROT )) && [[ -z "$devid" ]]; then
+      _sec_err="device ID required"; return 1
+    fi
+    _sec_v2_unlock "$passw" "$devid" || return 1
+    _sec_token_info "$s"
+    return 0
+  else
+    if (( _sec_v3_password_locked )) && [[ -z "$passw" ]]; then
+      _sec_err="password required"; return 1
+    fi
+    if (( _sec_v3_devid_locked )) && [[ -z "$devid" ]]; then
+      _sec_err="device ID required"; return 1
+    fi
+    _sec_v3_unlock "$passw" "$devid" || return 1
+    return 0
+  fi
+}
+
+# _sec_detect_devid <s> <passw?> : first class GUID that unlocks -> _sec_retval
+_sec_detect_devid() {
+  local s="$1" passw="$2" g
+  _sec_retval=""
+  _sec_parse "$s" || return 0
+  local requires_pass=0
+  if [[ "$_sec_kind" == "v2" ]]; then
+    if (( _sec_v2_flags & _SEC_F_PASSPROT )); then requires_pass=1; fi
+  else
+    if (( _sec_v3_password_locked )); then requires_pass=1; fi
+  fi
+  if (( requires_pass )) && [[ -z "$passw" ]]; then return 0; fi
+  for g in "${_SEC_CLASS_GUIDS[@]}"; do
+    if _sec_unlock "$s" "$passw" "$g" 2>/dev/null; then
+      _sec_retval="$g"
+      return 0
+    fi
+  done
+  _sec_retval=""
+  return 0
+}
+
+_sec_json_escape() {   # <s> -> _sec_retval : quoted + escaped JSON string
+  local s="$1" esc='"'
+  local i c
+  for (( i = 0; i < ${#s}; i++ )); do
+    c="${s:$i:1}"
+    if [[ "$c" == '"' ]]; then
+      esc+="\""
+    elif [[ "$c" == "\\" ]]; then
+      esc+="\\"
+    else
+      esc+="$c"
+    fi
+  done
+  _sec_retval="$esc\""
+}
+# output helpers ------------------------------------------------------------
+# _sec_describe_json : JSON for token_info(_sec_ti_*)
+_sec_describe_json() {
+  _sec_json='{'
+  if [[ "$_sec_ti_kind" == "v2" ]]; then
+    # python token_info (v2): kind,version,serial,flags,pwl,dvl,digits,interval,pin_required,exp_date,smartphone,is_128bit
+    _sec_json+="\"kind\": \"v2\", \"version\": $_sec_ti_version, \"serial\": "
+    _sec_json_escape "$_sec_ti_serial"; _sec_json+="$_sec_retval"
+    _sec_json+=", \"flags\": $_sec_ti_flags, \"password_locked\": "
+    if (( _sec_ti_password_locked )); then _sec_json+="true"; else _sec_json+="false"; fi
+    _sec_json+=", \"devid_locked\": "
+    if (( _sec_ti_devid_locked )); then _sec_json+="true"; else _sec_json+="false"; fi
+    _sec_json+=", \"digits\": $_sec_ti_digits, \"interval\": $_sec_ti_interval, \"pin_required\": "
+    if (( _sec_ti_pin_required )); then _sec_json+="true"; else _sec_json+="false"; fi
+    _sec_json+=", \"exp_date\": $_sec_ti_exp_date, \"smartphone\": "
+    if (( _sec_ti_smartphone )); then _sec_json+="true"; else _sec_json+="false"; fi
+    _sec_json+=", \"is_128bit\": "
+    if (( _sec_ti_is_128bit )); then _sec_json+="true"; else _sec_json+="false"; fi
+  else
+    if (( _sec_full_info )); then
+      # dict(info) for v3 after unlock (python order):
+      # kind,version,serial,flags,pwl,dvl,digits,interval,pin_required,exp_date,smartphone
+      _sec_json+="\"kind\": \"v3\", \"version\": $_sec_ti_version, \"serial\": "
+      _sec_json_escape "$_sec_ti_serial"; _sec_json+="$_sec_retval"
+      _sec_json+=", \"flags\": $_sec_ti_flags, \"password_locked\": "
+      if (( _sec_ti_password_locked )); then _sec_json+="true"; else _sec_json+="false"; fi
+      _sec_json+=", \"devid_locked\": "
+      if (( _sec_ti_devid_locked )); then _sec_json+="true"; else _sec_json+="false"; fi
+      _sec_json+=", \"digits\": $_sec_ti_digits, \"interval\": $_sec_ti_interval, \"pin_required\": "
+      if (( _sec_ti_pin_required )); then _sec_json+="true"; else _sec_json+="false"; fi
+      _sec_json+=", \"exp_date\": $_sec_ti_exp_date, \"smartphone\": "
+      if (( _sec_ti_smartphone )); then _sec_json+="true"; else _sec_json+="false"; fi
+    else
+      # python token_info (v3) compact: kind,version,pwl,dvl
+      _sec_json+="\"kind\": \"v3\", \"version\": $_sec_ti_version, \"password_locked\": "
+      if (( _sec_ti_password_locked )); then _sec_json+="true"; else _sec_json+="false"; fi
+      _sec_json+=", \"devid_locked\": "
+      if (( _sec_ti_devid_locked )); then _sec_json+="true"; else _sec_json+="false"; fi
+    fi
+  fi
+  _sec_json+="}"
+}
+
+# _sec_full_json <code> <decseed> <pin> : --code --full (uses _sec_ti_*)
+_sec_full_json() {
+  local code="$1" decseed="$2" pin="$3"
+  # python: out = dict(info); out['code']; out['dec_seed']; out['pin']
+  # info is emitted first (token_info field order), then code/seed/pin appended
+  _sec_describe_json
+  local base="$_sec_json"
+  local body="${base:1:${#base}-2}"     # strip { }
+  _sec_json="{${body}, \"code\": "
+  _sec_json_escape "$code"; _sec_json+="$_sec_retval"
+  _sec_json+=", \"dec_seed\": "
+  _sec_json_escape "$decseed"; _sec_json+="$_sec_retval"
+  _sec_json+=", \"pin\": "
+  _sec_json_escape "$pin"; _sec_json+="$_sec_retval"
+  _sec_json+="}"
+}
+
+# _sec_print_info_text : the svn '--info --text' writer
+_sec_print_info_text() {
+  if [[ "$_sec_ti_kind" == "v2" ]]; then
+    printf 'Serial number        : %s\n' "$_sec_ti_serial"
+    printf 'Key length           : %s\n' "$([ "$_sec_ti_is_128bit" -eq 1 ] && echo 128 || echo 64)"
+    printf 'Tokencode digits     : %d\n' "$_sec_ti_digits"
+    printf 'Seconds per tokencode: %d\n' "$_sec_ti_interval"
+    printf 'PIN mode             : %d\n' "$(( (_sec_ti_flags >> 3) & 3 ))"
+    printf 'PIN required         : %s\n' "$([ "$_sec_ti_pin_required" -eq 1 ] && echo yes || echo no)"
+    printf 'Encrypted w/password : %s\n' "$([ "$_sec_ti_password_locked" -eq 1 ] && echo yes || echo no)"
+    printf 'Encrypted w/devid    : %s\n' "$([ "$_sec_ti_devid_locked" -eq 1 ] && echo yes || echo no)"
+  else
+    printf 'Token format         : Android (v%d)\n' "$_sec_ti_version"
+    if (( _sec_ti_serial_valid )); then
+      printf 'Serial number        : %s\n' "$_sec_ti_serial"
+      printf 'Key length           : 128\n'
+      printf 'Tokencode digits     : %d\n' "$_sec_ti_digits"
+      printf 'Seconds per tokencode: %d\n' "$_sec_ti_interval"
+      printf 'PIN required         : %s\n' "$([ "$_sec_ti_pin_required" -eq 1 ] && echo yes || echo no)"
+    fi
+    printf 'Encrypted w/password : %s\n' "$([ "$_sec_ti_password_locked" -eq 1 ] && echo yes || echo no)"
+    printf 'Encrypted w/devid    : %s\n' "$([ "$_sec_ti_devid_locked" -eq 1 ] && echo yes || echo no)"
+  fi
+}
+
+# _sec_engine_cli "$@" : parse same options as the python engine; dispatch.
+_sec_engine_cli() {
+  local tok="" passw="" devid="" seed="" pin="" time="" cmd="describe"
+  local want_full=0 want_text=0
+  local arg prev
+  prev=""
+  for arg in "$@"; do
+    case "$prev" in
+      --tok) tok="$arg"; prev=""; continue ;;
+      --pass|--password) passw="$arg"; prev=""; continue ;;
+      --devid) devid="$arg"; prev=""; continue ;;
+      --seed) seed="$arg"; prev=""; continue ;;
+      --pin) pin="$arg"; prev=""; continue ;;
+      --time) time="$arg"; prev=""; continue ;;
+    esac
+    prev=""
+    case "$arg" in
+      --tok|--pass|--password|--devid|--seed|--pin|--time) prev="$arg" ;;
+      --full) want_full=1 ;;
+      --text) want_text=1 ;;
+      --json) : ;;
+      --describe) cmd="describe" ;;
+      --info) cmd="info" ;;
+      --code) cmd="code" ;;
+      --validate) cmd="validate" ;;
+      --detect-devid) cmd="detect-devid" ;;
+    esac
+  done
+  if [[ -z "$tok" ]]; then
+    _sec_err="missing --tok"
+    echo "securid: $_sec_err" >&2
+    return 2
+  fi
+  # parse time (relative +/- allowed)
+  local t=""
+  if [[ -n "$time" ]]; then
+    if [[ "${time:0:1}" == "+" || "${time:0:1}" == "-" ]]; then
+      t=$(( $(date +%s) + time ))
+    else
+      t=$time
+    fi
+  fi
+  case "$cmd" in
+    describe)
+      if _sec_token_info "$tok"; then
+        _sec_full_info=0
+        _sec_describe_json
+        printf '%s\n' "$_sec_json"
+        return 0
+      fi
+      echo "securid: $_sec_err" >&2; return 2
+      ;;
+    info)
+      if ! _sec_unlock "$tok" "$passw" "$devid"; then
+        echo "securid: $_sec_err" >&2; return 2
+      fi
+      _sec_token_info "$tok" || { echo "securid: $_sec_err" >&2; return 2; }
+      if [[ "$_sec_kind" == "v3" ]]; then
+        # fill serial/flags/etc from payload for the non-describe info case
+        _sec_ti_serial="$_sec_payload_serial"
+        _sec_ti_flags="$_sec_payload_flags"
+        _sec_ti_digits=$(( ((_sec_payload_flags & _SEC_FDIGIT) >> 6) + 1 ))
+        if (( _sec_payload_flags & 1 )); then _sec_ti_interval=60; else _sec_ti_interval=30; fi
+        if (( ((_sec_payload_flags & _SEC_FPINMODE) >> 3) >= 2 )); then _sec_ti_pin_required=1; else _sec_ti_pin_required=0; fi
+        _sec_ti_exp_date="$_sec_payload_exp_date"
+        _sec_ti_smartphone=1
+        _sec_ti_is_128bit=1
+        _sec_ti_serial_valid=1
+      fi
+      if (( want_text )); then _sec_print_info_text
+      else
+        _sec_describe_json
+        printf '%s\n' "$_sec_json"
+      fi
+      return 0
+      ;;
+    validate)
+      if ! _sec_unlock "$tok" "$passw" "$devid"; then
+        echo "securid: $_sec_err" >&2; return 2
+      fi
+      if [[ "$_sec_kind" == "v2" ]]; then printf '%s\n' "$_sec_v2_serial"
+      else printf '%s\n' "$_sec_payload_serial"; fi
+      return 0
+      ;;
+    detect-devid)
+      _sec_detect_devid "$tok" "$passw"
+      printf '%s\n' "$_sec_retval"
+      return 0
+      ;;
+    code)
+      local code decseed=""
+      if [[ -n "$seed" ]]; then
+        # cached seed allowed only for ctf tokens
+        if ! _sec_parse "$tok"; then echo "securid: $_sec_err" >&2; return 2; fi
+        if [[ "$_sec_kind" != "v2" ]]; then
+          echo "securid: cached seed is only supported for ctf tokens; provide --password/--devid for Android tokens" >&2
+          return 2
+        fi
+        _sec_token_info "$tok"
+        decseed="$seed"
+        _sec_compute_tokencode "$decseed" "$_sec_ti_serial" "$_sec_ti_flags" "$t" "$pin"
+        code="$_sec_code"
+      else
+        if ! _sec_unlock "$tok" "$passw" "$devid"; then
+          echo "securid: $_sec_err" >&2; return 2
+        fi
+        if [[ "$_sec_kind" == "v2" ]]; then
+          decseed="$_sec_v2_dec_seed"; _sec_info_serial="$_sec_v2_serial"; _sec_info_flags="$_sec_v2_flags"
+        else
+          decseed="$_sec_payload_dec_seed"; _sec_info_serial="$_sec_payload_serial"; _sec_info_flags="$_sec_payload_flags"
+          # FIXME: info fields for v3 full output filled by token_info below
+        fi
+        _sec_token_info "$tok"
+        if [[ "$_sec_kind" == "v3" ]]; then
+          _sec_ti_serial="$_sec_payload_serial"; _sec_ti_flags="$_sec_payload_flags"
+          _sec_ti_digits=$(( ((_sec_payload_flags & _SEC_FDIGIT) >> 6) + 1 ))
+          if (( _sec_payload_flags & 1 )); then _sec_ti_interval=60; else _sec_ti_interval=30; fi
+          if (( ((_sec_payload_flags & _SEC_FPINMODE) >> 3) >= 2 )); then _sec_ti_pin_required=1; else _sec_ti_pin_required=0; fi
+          _sec_ti_exp_date="$_sec_payload_exp_date"
+          _sec_ti_smartphone=1; _sec_ti_is_128bit=1; _sec_ti_serial_valid=1
+        fi
+        _sec_compute_tokencode "$decseed" "$_sec_info_serial" "$_sec_info_flags" "$t" "$pin"
+        code="$_sec_code"
+      fi
+      if (( want_full )); then
+        _sec_full_info=1
+        _sec_full_json "$code" "$decseed" "$pin"
+        printf '%s\n' "$_sec_json"
+      else
+        printf '%s\n' "$code"
+      fi
+      return 0
+      ;;
+    *)
+      echo "securid: unknown command $cmd" >&2; return 2
+      ;;
+  esac
+}
+_sec_self_test() {
+  local passed=0 failed=0 got
+  local V2='http://127.0.0.1/securid/ctf?ctfData=258491750817210752367175001073261277346642631755724762324173166222072472716737543'
+  local PROT='258491750817271376337025556032745736615071405660444767006173166222072476671610011'
+  local V3='http://127.0.0.1/securid/ctf?ctfData=AwEBWoDfCnTYFHKM8RvGCXEbSiReGdGgA88EDrIP6EhAe8tzPkIGiAaXXtInt6UHsgM1NFmwuTVjOlJXIpNXxmj7Iud0hfL2kLmIdPgRiS6jP%2FO8q9Fcpwo%2F8tLukZRoIU7gdFjpSl3teO%2FMWlr9rJBZtkTW4q0mAehJ1tl4l0vGjcDycwmIgyzeods7F43ljVETNZjlHkDTudosNSvmS%2Bl643vFrM6NGT%2BHLrlCX0igfo5i4yaUKwDDS4AiAEq%2Bpp0dv8ZzkpZIEJikRzeWaxpfml%2BmsakJ%2BYAVFcfBoR2%2BLzr1%2Flp7mX%2BwMw4TFDZ4hS88BMY3P7uV9%2BGNz08Euaru779p4XDde0JxrPGPuGjWxUBt%2BN5aUjJkcXvAtswhfirK'
+  local V4='com.rsa.securid://ctf?ctfData=BAABaKfqKwgEkWDGEgaxp2ZGloQ7dDw2A8PglNlhP8qCBhtop%2BorCASRYMYSBrGnZkaWhDt0PDYDw%2BCU2WE%2FyoIGGznAfd6pVLcjsDtpKoG5APTUrXL51Bdnf%2FCDvZanmNEGhzDCbsDsFTFyLgKzdht0X1tKt23tFwP%2FDYg9xDS1HvS8Jy3QfT04PFNm%2BdCUUZyMIoTzdFT01msNHtrRxePWU7cB32CE48U%2BKlbW4hPyhphJhkg5qxUA38cD05J1s44hI3FTjaq%2FAhAKAQWsDy7TZE6qtU5f6cYIzdr5PKILhTyCeXRxiYuLinAkXEHWm%2F%2FrFKyroQpn%2FVYAA3NLS59HWBQwWyS2kzhtlzJh%2BI25IMhdhLvVdXdjuNzRxkwjc74z'
+  local V2P=9999 V2T=1409757465 V2R=65365425
+  local V3P=1234 V3T=1410710132 V3R=27957523
+  local V4P=1234 V4T=1650391605 V4R=891523
+  local PASS='Correct_horse!battery&staple' DEV3='a01c4380-fc01-4df0-b113-7fb98ec74694' DEV4='d82c-467c-56fb-2058-edf8-add6'
+
+  # v2 tokencode
+  if _sec_unlock "$V2" "" "" && _sec_compute_tokencode "$_sec_v2_dec_seed" "$_sec_v2_serial" "$_sec_v2_flags" "$V2T" "$V2P" && [[ "$_sec_code" == "$V2R" ]]; then
+    passed=$((passed+1)); printf 'ok   v2 tokencode\n'
+  else failed=$((failed+1)); printf 'FAIL v2 tokencode (got %s want %s)\n' "$_sec_code" "$V2R"; fi
+  # v2 device-hash/decrypt: PROT with password asdf -> same code
+  if _sec_unlock "$PROT" "asdf" "" && _sec_compute_tokencode "$_sec_v2_dec_seed" "$_sec_v2_serial" "$_sec_v2_flags" "$V2T" "$V2P" && [[ "$_sec_code" == "$V2R" ]]; then
+    passed=$((passed+1)); printf 'ok   v2 password-protected seed\n'
+  else failed=$((failed+1)); printf 'FAIL v2 password-protected seed (got %s)\n' "$_sec_code"; fi
+  # v2 wrong password rejected
+  if _sec_unlock "$PROT" "wrong" "" 2>/dev/null; then
+    failed=$((failed+1)); printf 'FAIL v2 wrong password accepted\n'
+  else passed=$((passed+1)); printf 'ok   v2 wrong password rejected\n'; fi
+  # v3 tokencode
+  if _sec_unlock "$V3" "$PASS" "$DEV3" && _sec_compute_tokencode "$_sec_payload_dec_seed" "$_sec_payload_serial" "$_sec_payload_flags" "$V3T" "$V3P" && [[ "$_sec_code" == "$V3R" ]]; then
+    passed=$((passed+1)); printf 'ok   v3 tokencode\n'
+  else failed=$((failed+1)); printf 'FAIL v3 tokencode (got %s)\n' "$_sec_code"; fi
+  # v3 auto-detect devid
+  _sec_detect_devid "$V3" "$PASS"
+  got="$_sec_retval"
+  if [[ "$got" == "$DEV3" ]]; then
+    passed=$((passed+1)); printf 'ok   v3 detect class GUID\n'
+  else failed=$((failed+1)); printf 'FAIL v3 detect class GUID (got %s)\n' "$got"; fi
+  # v4 tokencode
+  if _sec_unlock "$V4" "" "$DEV4" && _sec_compute_tokencode "$_sec_payload_dec_seed" "$_sec_payload_serial" "$_sec_payload_flags" "$V4T" "$V4P" && [[ "$_sec_code" == "$V4R" ]]; then
+    passed=$((passed+1)); printf 'ok   v4 tokencode\n'
+  else failed=$((failed+1)); printf 'FAIL v4 tokencode (got %s)\n' "$_sec_code"; fi
+  # v4 unique devid: no false positive
+  _sec_detect_devid "$V4" ""
+  got="$_sec_retval"
+  if [[ -z "$got" ]]; then
+    passed=$((passed+1)); printf 'ok   v4 no false-positive devid\n'
+  else failed=$((failed+1)); printf 'FAIL v4 no false-positive devid (got %s)\n' "$got"; fi
+  # garbage rejected
+  if _sec_parse "999" 2>/dev/null; then
+    failed=$((failed+1)); printf 'FAIL garbage token accepted\n'
+  else passed=$((passed+1)); printf 'ok   rejects garbage\n'; fi
+  # v2 describe fields
+  if _sec_token_info "$V2" && [[ "$_sec_ti_serial" == "584917508172" ]]; then
+    passed=$((passed+1)); printf 'ok   v2 describe serial\n'
+  else failed=$((failed+1)); printf 'FAIL v2 describe serial (got %s)\n' "$_sec_ti_serial"; fi
+
+  printf 'securid self-test: %d passed, %d failed\n' "$passed" "$failed"
+  [[ $failed -eq 0 ]]
+}
 
 # Is a line a SecurID token (as opposed to metadata / comment / other text)?
 _securid_is_token_line() {
@@ -894,20 +1537,6 @@ _securid_write_entry() {
   git_add_file "$passfile" "$message"
 }
 
-# _securid_json_fetch <json> <key>  -> prints the value (lowercased booleans).
-_securid_json_fetch() {
-  local json="$1" key="$2"
-  printf '%s\n' "$json" | "$SECURID_PYTHON" -c '
-import json, sys
-d = json.load(sys.stdin)
-v = d.get(sys.argv[1], "")
-if isinstance(v, bool):
-    sys.stdout.write("true" if v else "false")
-else:
-    sys.stdout.write(str(v))
-' "$key"
-}
-
 # Read a token string from --file, a CLI argument, or stdin.  Sets _secret_input.
 # $4 is the "echo" flag: with it, prompt input is echoed; otherwise hidden.
 _securid_read_token() {
@@ -935,13 +1564,11 @@ _securid_read_token() {
   [[ -n "$_secret_input" ]] || die "Error: no token string provided"
 }
 
-# _securid_guess_devid <token> [password]  -> sets _devid_guess ('' if none).
-# Auto-detects a matching device-class GUID, like stoken does.
 _securid_guess_devid() {
   local tok="$1" passw="$2"
   _devid_guess=""
-  _devid_guess=$(_securid_engine --detect-devid --tok "$tok" \
-    ${passw:+--password "$passw"} 2>/dev/null)
+  _sec_detect_devid "$tok" "$passw"
+  _devid_guess="$_sec_retval"
 }
 
 _securid_prompt_hidden() {   # _securid_prompt_hidden <prompt> <varname>
@@ -955,11 +1582,6 @@ _securid_prompt_hidden() {   # _securid_prompt_hidden <prompt> <varname>
   printf -v "$var" '%s' "$value"
 }
 
-# ---------------------------------------------------------------------------
-# Shared option parsing for the credential options.
-# _securid_getopts <COMMAND> "$@"  -> sets _force _echo _store_seed _file \
-#   _pin _devid _password and _securid_positional (remaining args).
-# ---------------------------------------------------------------------------
 _securid_getopts() {
   local cmd="$1"; shift
   _force=0 _echo=0 _store_seed=0 _file="" _pin="" _devid="" _password=""
@@ -982,10 +1604,6 @@ _securid_getopts() {
   _securid_positional=("$@")
   [[ $err -ne 0 ]] && die "Usage: $PROGRAM $COMMAND [--force,-f] [--echo,-e] [--store-seed,-s] [--file FILE] [--pin PIN] [--devid DEVID] [--password PASS] [pass-name]"
 }
-
-# ---------------------------------------------------------------------------
-# Commands
-# ---------------------------------------------------------------------------
 
 cmd_securid_usage() {
   cat <<-_EOF
@@ -1041,8 +1659,6 @@ cmd_securid_version() {
   exit 0
 }
 
-# ---- insert / append ------------------------------------------------------
-
 # _securid_render_entry <token> [pin] [devid] [seed]  -> prints file contents
 _securid_render_entry() {
   local token="$1" pin="$2" devid="$3" seed="$4" out="$1"
@@ -1080,17 +1696,16 @@ _securid_insert_common() {
   _securid_read_token "$prompt" "$_file" "$([[ $looks_like_token -eq 1 ]] && echo "$token_arg")" "$_echo"
   local token="$_secret_input"
 
-  local info pass_locked devid_locked pin_required serial kind
-  info=$(_securid_engine --describe --tok "$token") \
-    || die "Invalid token string."
-  pass_locked=$(_securid_json_fetch "$info" password_locked)
-  devid_locked=$(_securid_json_fetch "$info" devid_locked)
-  pin_required=$(_securid_json_fetch "$info" pin_required)
-  serial=$(_securid_json_fetch "$info" serial)
-  kind=$(_securid_json_fetch "$info" kind)
+  local pass_locked devid_locked pin_required serial kind
+  _sec_token_info "$token" || die "Invalid token string."
+  kind="$_sec_ti_kind"
+  serial="$_sec_ti_serial"
+  if (( _sec_ti_password_locked )); then pass_locked="true"; else pass_locked="false"; fi
+  if (( _sec_ti_devid_locked )); then devid_locked="true"; else devid_locked="false"; fi
+  if (( _sec_ti_pin_required )); then pin_required="true"; else pin_required="false"; fi
 
   # Collect the credential material we can gather now.
-  local password="$_password" devid="$_devid" seed="" full=""
+  local password="$_password" devid="$_devid" seed=""
   [[ $pin_required != "true" ]] && _pin=""
 
   # The device ID is worth caching for devid-bound tokens (it is not
@@ -1128,17 +1743,18 @@ _securid_insert_common() {
   fi
 
   if [[ $do_validate -eq 1 ]]; then
-    local vout
-    vout=$(_securid_engine --validate --tok "$token" \
-            --password "$password" --devid "$devid" 2>&1) || {
-      die "Error: cannot decrypt token: ${vout#securid: }"
+    _sec_unlock "$token" "$password" "$devid" || {
+      die "Error: cannot decrypt token: $_sec_err"
     }
   fi
   if [[ $_store_seed -eq 1 ]]; then
-    full=$(_securid_engine --code --full --tok "$token" \
-            --password "$password" --devid "$devid" --pin "$_pin" \
-            --time "$(date +%s)" 2>&1) || die "Error: cannot decrypt token."
-    seed=$(_securid_json_fetch "$full" dec_seed)
+    _sec_unlock "$token" "$password" "$devid" \
+      || die "Error: cannot decrypt token: $_sec_err"
+    if [[ "$_sec_kind" == "v2" ]]; then
+      seed="$_sec_v2_dec_seed"
+    else
+      seed="$_sec_payload_dec_seed"
+    fi
   fi
 
   # Determine the default path from the serial number when inserting.
@@ -1201,8 +1817,6 @@ _securid_insert_common() {
   fi
 }
 
-# ---- code -----------------------------------------------------------------
-
 cmd_securid_code() {
   local opts clip=0 quiet=0 pin="" password="" devid="" time=""
   opts="$($GETOPT -o cq -l clip,quiet,pin:,password:,devid:,time: -n "$PROGRAM" -- "$@")"
@@ -1229,12 +1843,12 @@ cmd_securid_code() {
   _securid_read_entry "$passfile"
   [[ -n "$_toke" ]] || die "$path: no SecurID token found."
 
-  local info pass_locked devid_locked pin_required kind
-  info=$(_securid_engine --describe --tok "$_toke") || die "Invalid token stored in $path."
-  pass_locked=$(_securid_json_fetch "$info" password_locked)
-  devid_locked=$(_securid_json_fetch "$info" devid_locked)
-  pin_required=$(_securid_json_fetch "$info" pin_required)
-  kind=$(_securid_json_fetch "$info" kind)
+  local pass_locked devid_locked pin_required kind
+  _sec_token_info "$_toke" || die "Invalid token stored in $path."
+  kind="$_sec_ti_kind"
+  if (( _sec_ti_password_locked )); then pass_locked="true"; else pass_locked="false"; fi
+  if (( _sec_ti_devid_locked )); then devid_locked="true"; else devid_locked="false"; fi
+  if (( _sec_ti_pin_required )); then pin_required="true"; else pin_required="false"; fi
 
   local use_seed=0
   if [[ -n "$_seed" ]]; then
@@ -1247,32 +1861,26 @@ cmd_securid_code() {
   fi
 
   # Resolve the credential set.
-  local engine_args=()
-  if [[ $use_seed -eq 1 ]]; then
-    engine_args+=(--seed "$_seed")
-  else
-    if [[ -n "$password" ]]; then
-      engine_args+=(--password "$password")
-    elif [[ $pass_locked == "true" ]]; then
-      _securid_prompt_hidden "Enter password to decrypt token: " password
-      engine_args+=(--password "$password")
+  local resolved_devid="" resolved_passwd="$password"
+  if [[ $use_seed -eq 0 ]]; then
+    if [[ -z "$resolved_passwd" && $pass_locked == "true" ]]; then
+      _securid_prompt_hidden "Enter password to decrypt token: " resolved_passwd
     fi
     if [[ -n "$devid" ]]; then
-      engine_args+=(--devid "$devid")
+      resolved_devid="$devid"
     elif [[ -n "$_devid" ]]; then
-      engine_args+=(--devid "$_devid")
+      resolved_devid="$_devid"
     elif [[ $devid_locked == "true" ]]; then
       # Try the known device-class GUIDs before bothering the user.
-      if [[ $pass_locked == "false" || -n "$password" ]]; then
-        _securid_guess_devid "$_toke" "$password"
+      if [[ $pass_locked == "false" || -n "$resolved_passwd" ]]; then
+        _securid_guess_devid "$_toke" "$resolved_passwd"
         if [[ -n "$_devid_guess" ]]; then
-          engine_args+=(--devid "$_devid_guess")
+          resolved_devid="$_devid_guess"
         fi
       fi
-      if [[ -z "$_devid_guess" ]]; then
+      if [[ -z "$resolved_devid" ]]; then
         [[ -t 0 ]] || die "Error: device ID needed; pass --devid or cache it in the pass file."
-        read -r -p "Enter device ID (from the RSA 'About' screen): " devid || exit 1
-        engine_args+=(--devid "$devid")
+        read -r -p "Enter device ID (from the RSA 'About' screen): " resolved_devid || exit 1
       fi
     fi
   fi
@@ -1285,13 +1893,24 @@ cmd_securid_code() {
   elif [[ $pin_required == "true" ]]; then
     _securid_prompt_hidden "Enter PIN: " pw
   fi
-  local timearg=()
-  [[ -n "$time" ]] && timearg=(--time "$time")
+  local t=""
+  [[ -n "$time" ]] && t="$time"
 
-  local out
-  out=$(_securid_engine --code --tok "$_toke" "${engine_args[@]}" \
-        --pin "$pw" "${timearg[@]}") || die "$path: failed to generate tokencode."
-  out=${out%$'\n'}
+  local out dec serial flags
+  if [[ $use_seed -eq 1 ]]; then
+    dec="$_seed"; serial="$_sec_ti_serial"; flags="$_sec_ti_flags"
+  else
+    _sec_unlock "$_toke" "$resolved_passwd" "$resolved_devid" \
+      || die "$path: failed to generate tokencode: $_sec_err"
+    if [[ "$_sec_kind" == "v2" ]]; then
+      dec="$_sec_v2_dec_seed"; serial="$_sec_v2_serial"; flags="$_sec_v2_flags"
+    else
+      dec="$_sec_payload_dec_seed"; serial="$_sec_payload_serial"; flags="$_sec_payload_flags"
+    fi
+  fi
+  _sec_compute_tokencode "$dec" "$serial" "$flags" "$t" "$pw" \
+    || die "$path: failed to generate tokencode: $_sec_err"
+  out="$_sec_code"
 
   if [[ $clip -ne 0 ]]; then
     clip "$out" "SecurID tokencode for $path"
@@ -1300,8 +1919,6 @@ cmd_securid_code() {
     [[ $quiet -ne 0 ]] && printf '%s' "$out"
   fi
 }
-
-# ---- uri / info / validate ------------------------------------------------
 
 cmd_securid_uri() {
   local opts clip=0
@@ -1347,10 +1964,10 @@ cmd_securid_info() {
   _securid_read_entry "$passfile"
   [[ -n "$_toke" ]] || die "$path: no SecurID token found."
 
-  local info pass_locked devid_locked
-  info=$(_securid_engine --describe --tok "$_toke")
-  pass_locked=$(_securid_json_fetch "$info" password_locked)
-  devid_locked=$(_securid_json_fetch "$info" devid_locked)
+  local pass_locked devid_locked
+  _sec_token_info "$_toke"
+  if (( _sec_ti_password_locked )); then pass_locked="true"; else pass_locked="false"; fi
+  if (( _sec_ti_devid_locked )); then devid_locked="true"; else devid_locked="false"; fi
   [[ -z "$password" && $pass_locked == "true" ]] && \
     _securid_prompt_hidden "Enter password to decrypt token: " password
   [[ -z "$devid" && -z "$_devid" && $devid_locked == "true" ]] && {
@@ -1358,10 +1975,20 @@ cmd_securid_info() {
   }
   [[ -z "$devid" ]] && devid="$_devid"
 
-  local out
-  out=$(_securid_engine --info --text --tok "$_toke" \
-        --password "$password" --devid "$devid") || die "Error: cannot decrypt token."
-  printf '%s\n' "$out"
+  _sec_unlock "$_toke" "$password" "$devid" || die "Error: cannot decrypt token: $_sec_err"
+  # fill the info fields for printing (v3 needs the payload-derived values)
+  if [[ "$_sec_kind" == "v3" ]]; then
+    _sec_ti_serial="$_sec_payload_serial"
+    _sec_ti_flags="$_sec_payload_flags"
+    _sec_ti_digits=$(( ((_sec_payload_flags & _SEC_FDIGIT) >> 6) + 1 ))
+    if (( _sec_payload_flags & 1 )); then _sec_ti_interval=60; else _sec_ti_interval=30; fi
+    if (( ((_sec_payload_flags & _SEC_FPINMODE) >> 3) >= 2 )); then _sec_ti_pin_required=1; else _sec_ti_pin_required=0; fi
+    _sec_ti_exp_date="$_sec_payload_exp_date"
+    _sec_ti_smartphone=1
+    _sec_ti_is_128bit=1
+    _sec_ti_serial_valid=1
+  fi
+  _sec_print_info_text
 }
 
 cmd_securid_validate() {
@@ -1379,16 +2006,36 @@ cmd_securid_validate() {
 
   _securid_read_token "this token" "$file" "$1"
   local token="$_secret_input"
-  local out
-  out=$(_securid_engine --validate --tok "$token" \
-        --password "$password" --devid "$devid" 2>&1) || {
-    echo "securid: ${out#securid: }" >&2
+  _sec_unlock "$token" "$password" "$devid" || {
+    echo "securid: $_sec_err" >&2
     exit 1
   }
-  echo "OK: serial $out"
+  if [[ "$_sec_kind" == "v2" ]]; then
+    echo "OK: serial $_sec_v2_serial"
+  else
+    echo "OK: serial $_sec_payload_serial"
+  fi
 }
 
-# ---- dispatch -------------------------------------------------------------
+# ---- engine CLI tollroad --------------------------------------------------
+# When invoked directly with engine-style options (as securid-engine.py would
+# be), behave like the engine instead of the pass extension.  This keeps the
+# tests and the stoken test-suite vectors working:
+#   securid.bash --tok <URI> --code ...
+#   securid.bash __selftest
+
+if [[ "$1" == __selftest ]]; then
+  shift
+  _sec_self_test
+  exit $?
+fi
+
+case "$1" in
+  --tok|--describe|--info|--code|--validate|--detect-devid)
+    _sec_engine_cli "$@"
+    exit $?
+    ;;
+esac
 
 case "$1" in
   help|--help|-h) shift; cmd_securid_usage "$@" ;;

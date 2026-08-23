@@ -1,17 +1,16 @@
 #!/usr/bin/env bash
 # End-to-end test suite for pass-securid.
 #
-# Requirements: bash, python3, gpg, git, pass (>= 1.7), getopt.
+# Requirements: bash, gpg, git, pass (>= 1.7), getopt.
 # Builds an isolated vault + GPG key, then exercises insert/code/uri/info/
 # validate/append against real SecurID token vectors with known outputs.
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ENGINE="$ROOT/securid-engine.py"
+ENGINE="$ROOT/securid.bash"
 EXTDIR="$ROOT"
 
 PASS="${PASS:-pass}"
-PY="${PYTHON:-python3}"
 
 # --- test vectors (from the upstream stoken test-suite, fixed time/pin) -----
 V2='http://127.0.0.1/securid/ctf?ctfData=258491750817210752367175001073261277346642631755724762324173166222072472716737543'
@@ -38,30 +37,24 @@ check() { # check <desc> <expected> <actual>
 # ---------------------------------------------------------------------------
 # 1) engine unit vectors (no pass/gpg needed)
 # ---------------------------------------------------------------------------
-got=$("$PY" "$ENGINE" --code --tok "$V2" --pin "$V2_PIN" --time "$V2_T" 2>/dev/null)
+got=$("$ENGINE" --code --tok "$V2" --pin "$V2_PIN" --time "$V2_T" 2>/dev/null)
 check "engine v2 tokencode" "$V2_REF" "$got"
 
-got=$("$PY" "$ENGINE" --code --tok "$V3" --pass "$V3_PASS" --devid "$V3_DEV" --pin "$V3_PIN" --time "$V3_T" 2>/dev/null)
+got=$("$ENGINE" --code --tok "$V3" --pass "$V3_PASS" --devid "$V3_DEV" --pin "$V3_PIN" --time "$V3_T" 2>/dev/null)
 check "engine v3 tokencode" "$V3_REF" "$got"
 
-got=$("$PY" "$ENGINE" --code --tok "$V4" --devid "$V4_DEV" --pin "$V4_PIN" --time "$V4_T" 2>/dev/null)
+got=$("$ENGINE" --code --tok "$V4" --devid "$V4_DEV" --pin "$V4_PIN" --time "$V4_T" 2>/dev/null)
 check "engine v4 tokencode" "$V4_REF" "$got"
 
 # class-GUID auto-detection (like stoken)
-got=$("$PY" "$ENGINE" --detect-devid --tok "$V3" --pass "$V3_PASS" 2>/dev/null)
+got=$("$ENGINE" --detect-devid --tok "$V3" --pass "$V3_PASS" 2>/dev/null)
 check "engine detect class GUID (android)" "$V3_DEV" "$got"
-got=$("$PY" "$ENGINE" --detect-devid --tok "$V4" 2>/dev/null)
+got=$("$ENGINE" --detect-devid --tok "$V4" 2>/dev/null)
 check "engine no false-positive (unique devid)" "" "$got"
 
-if "$PY" "$ENGINE" --describe --tok "999999" 2>/dev/null; then
+if "$ENGINE" --describe --tok "999999" 2>/dev/null; then
   bad "engine rejects garbage"; else ok "engine rejects garbage"; fi
 
-# engine/bundled copy in sync
-if "$PY" "$ROOT/tools/embed.py" --check >/dev/null 2>&1; then
-  ok "securid.bash engine in sync with securid-engine.py"
-else
-  bad "securid.bash engine out of sync (run: tools/embed.py)"
-fi
 
 # ---------------------------------------------------------------------------
 # 2) full pass integration in an isolated vault
