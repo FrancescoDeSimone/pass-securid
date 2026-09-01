@@ -40,6 +40,19 @@ check() { # check <desc> <expected> <actual>
 got=$("$ENGINE" --code --tok "$V2" --pin "$V2_PIN" --time "$V2_T" 2>/dev/null)
 check "engine v2 tokencode" "$V2_REF" "$got"
 
+# Default time must mean "now".  Bracket the call so this remains correct
+# even if it crosses a tokencode boundary.
+now_before=$(date +%s)
+got=$("$ENGINE" --code --tok "$V2" --pin "$V2_PIN" 2>/dev/null)
+now_after=$(date +%s)
+code_before=$("$ENGINE" --code --tok "$V2" --pin "$V2_PIN" --time "$now_before" 2>/dev/null)
+code_after=$("$ENGINE" --code --tok "$V2" --pin "$V2_PIN" --time "$now_after" 2>/dev/null)
+if [[ "$got" == "$code_before" || "$got" == "$code_after" ]]; then
+  ok "engine defaults to current time"
+else
+  bad "engine defaults to current time (got '$got', expected '$code_before' or '$code_after')"
+fi
+
 got=$("$ENGINE" --code --tok "$V3" --pass "$V3_PASS" --devid "$V3_DEV" --pin "$V3_PIN" --time "$V3_T" 2>/dev/null)
 check "engine v3 tokencode" "$V3_REF" "$got"
 
@@ -95,6 +108,30 @@ p() { "$PASS" securid "$@"; }
 # insert (echoed token) + code
 got=$(printf '%s\n' "$V2" | p insert --force token1) && got=$(p code --pin "$V2_PIN" --time "$V2_T" token1 2>/dev/null)
 check "pass insert + code (v2)" "$V2_REF" "$got"
+
+# Exercise the reported user path: pass code with no --time must use now.
+now_before=$(date +%s)
+got=$(p code --pin "$V2_PIN" token1 2>/dev/null)
+now_after=$(date +%s)
+code_before=$(p code --pin "$V2_PIN" --time "$now_before" token1 2>/dev/null)
+code_after=$(p code --pin "$V2_PIN" --time "$now_after" token1 2>/dev/null)
+if [[ "$got" == "$code_before" || "$got" == "$code_after" ]]; then
+  ok "pass code defaults to current time"
+else
+  bad "pass code defaults to current time (got '$got', expected '$code_before' or '$code_after')"
+fi
+
+# The direct pass path must retain the Python engine's relative-time syntax.
+now_before=$(date +%s)
+got=$(p code --pin "$V2_PIN" --time +0 token1 2>/dev/null)
+now_after=$(date +%s)
+code_before=$(p code --pin "$V2_PIN" --time "$now_before" token1 2>/dev/null)
+code_after=$(p code --pin "$V2_PIN" --time "$now_after" token1 2>/dev/null)
+if [[ "$got" == "$code_before" || "$got" == "$code_after" ]]; then
+  ok "pass relative time +0 uses current time"
+else
+  bad "pass relative time +0 (got '$got', expected '$code_before' or '$code_after')"
+fi
 
 # uri
 got=$(p uri token1)

@@ -883,6 +883,13 @@ _sec_key_from_time() {
 _sec_compute_tokencode() {
   local dec_seed="$1" serial="$2" flags="$3" t="$4" pin="$5"
   _sec_err=""
+  # Python's compute_tokencode() used time.time() when t was omitted.  Keep
+  # that public behavior here; the direct pass CLI also leaves t empty.
+  if [[ -z "$t" ]]; then
+    t=$(date +%s)
+  elif [[ "${t:0:1}" == "+" || "${t:0:1}" == "-" ]]; then
+    t=$(( $(date +%s) + t ))
+  fi
   local is_30=1
   if (( (flags & _SEC_FNUM) != 0 )); then is_30=0; fi
   _sec_epoch_parts "$t"
